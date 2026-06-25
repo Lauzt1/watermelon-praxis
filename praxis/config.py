@@ -9,8 +9,8 @@ class Config:
     openrouter_key: str = os.getenv("OPENROUTER_API_KEY", "")
     github_token: str = os.getenv("GITHUB_TOKEN", "")
     github_repo: str = os.getenv("GITHUB_REPO", "")
-    model_workhorse: str = os.getenv("PRAXIS_MODEL_WORKHORSE", "z-ai/glm-4.6")
-    model_planner: str = os.getenv("PRAXIS_MODEL_PLANNER", "openai/gpt-oss-120b")
+    model_workhorse: str = os.getenv("PRAXIS_MODEL_WORKHORSE", "deepseek/deepseek-v4-pro")
+    model_planner: str = os.getenv("PRAXIS_MODEL_PLANNER", "deepseek/deepseek-v4-flash")
     db_path: str = os.getenv("PRAXIS_DB", "data/praxis.db")
 
 def load() -> Config:
