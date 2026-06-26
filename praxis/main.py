@@ -41,13 +41,15 @@ def cmd_seed(args: argparse.Namespace, config: Config) -> None:
     client = GitHub(config.github_token, config.github_repo)
     try:
         result = seeding.seed_repo(client)
-        created, skipped = result["created"], result["skipped"]
-        print(f"seed: {len(created)} created, {len(skipped)} already present "
+        created, skipped, closed = result["created"], result["skipped"], result["closed"]
+        print(f"seed: {len(created)} created, {len(skipped)} kept, {len(closed)} closed "
               f"(repo {config.github_repo})")
+        for c in closed:
+            print(f"  - #{c['number']} closed (stale/dirty): {c['title']}")
         for c in created:
             print(f"  + #{c['number']} {c['title']}  labels={c['labels']}")
         for title in skipped:
-            print(f"  = (exists) {title}")
+            print(f"  = (kept) {title}")
     finally:
         client.close()
 

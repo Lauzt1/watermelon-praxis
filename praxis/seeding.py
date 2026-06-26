@@ -52,22 +52,55 @@ DEMO_INSTRUCTION_3 = (
 )
 DEMO_INSTRUCTIONS = [DEMO_INSTRUCTION_1, DEMO_INSTRUCTION_2, DEMO_INSTRUCTION_3]
 
+# The triage marker Instruction 3 applies. A canonical issue carrying it (or a milestone) is a
+# leftover from a prior triage run, so seed resets it to keep each demo run starting un-triaged.
+TRIAGE_LABEL = "needs-triage"
+
 
 def _open_issues(client) -> list[dict[str, Any]]:
-    """Open issues only (the seed's idempotency key space). GitHub's /issues list also
-    returns PRs; we don't create those, so title-matching against it is safe here."""
+    """Open issues only (the seed's reset key space). GitHub's /issues list also returns PRs;
+    they carry a 'pull_request' key, so we skip them and never touch a PR."""
     resp = client.rest_get(f"/repos/{client.repo}/issues", params={"state": "open"})
-    return resp if isinstance(resp, list) else []
+    issues = resp if isinstance(resp, list) else []
+    return [i for i in issues if "pull_request" not in i]
 
 
-def seed_repo(client) -> dict[str, Any]:
-    """Idempotently ensure SEED_ISSUES exist as open issues. Returns a summary of what was
-    created vs already present. Labels are added directly (GitHub auto-creates a missing one)."""
-    existing_titles = {i.get("title") for i in _open_issues(client)}
+def _label_names(issue: dict) -> set[str]:
+    return {l.get("name") for l in (issue.get("labels") or []) if isinstance(l, dict)}
+
+
+def _is_clean_canonical(issue: dict, canonical_titles: set[str]) -> bool:
+    """A canonical-titled issue that is open, un-triaged (no needs-triage label) and on no
+    milestone — i.e. reusable as-is, so seed keeps it instead of churning a new one."""
+    return (issue.get("title") in canonical_titles
+            and TRIAGE_LABEL not in _label_names(issue)
+            and not issue.get("milestone"))
+
+
+def seed_repo(client, reset: bool = True) -> dict[str, Any]:
+    """Converge the repo to exactly the canonical SEED_ISSUES as fresh, open, un-triaged issues
+    (spec §11 'resets the sandbox to a known set'). Idempotent: when the repo is already clean it
+    is a no-op; otherwise it closes every other open issue (stale or dirty) and creates the
+    missing canonical ones. Labels are added directly (GitHub auto-creates a missing one).
+
+    `reset=False` keeps the older create-only behaviour (used by tooling that must not close)."""
+    canonical_titles = {s["title"] for s in SEED_ISSUES}
+    reusable: dict[str, dict] = {}
+    closed: list[dict[str, Any]] = []
+    for issue in _open_issues(client):
+        if reset and _is_clean_canonical(issue, canonical_titles) and issue["title"] not in reusable:
+            reusable[issue["title"]] = issue        # keep one clean copy per canonical title
+        elif reset:
+            client.rest_patch(f"/repos/{client.repo}/issues/{issue['number']}",
+                              json={"state": "closed"})
+            closed.append({"number": issue["number"], "title": issue.get("title")})
+        elif issue["title"] in canonical_titles:
+            reusable.setdefault(issue["title"], issue)
+
     created: list[dict[str, Any]] = []
     skipped: list[str] = []
     for spec in SEED_ISSUES:
-        if spec["title"] in existing_titles:
+        if spec["title"] in reusable:
             skipped.append(spec["title"])
             continue
         resp = client.rest_post(
@@ -79,7 +112,7 @@ def seed_repo(client) -> dict[str, Any]:
             client.rest_post(f"/repos/{client.repo}/issues/{number}/labels",
                              json={"labels": spec["labels"]})
         created.append({"number": number, "title": spec["title"], "labels": spec.get("labels", [])})
-    return {"created": created, "skipped": skipped}
+    return {"created": created, "skipped": skipped, "closed": closed}
 
 
 def prewarm(run_one, times: int, instructions: list[str] | None = None) -> list[dict[str, Any]]:
