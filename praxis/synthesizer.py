@@ -139,12 +139,18 @@ def _replay_inverse(client: Any, inv: InverseOp) -> None:
 
 # input names a transform conventionally uses for "the list it operates on"
 _LIST_INPUT_ALIASES = ("issues", "items", "rows", "data", "results")
+# input names a synthesised *.ensure skill might give its single subject — the executor seeds
+# the real subject under run_refs["label"] / run_refs["milestone"], so whatever the LLM named
+# the input, the REAL value reaches it (never the safe synthesis test placeholder).
+_LABEL_INPUT_ALIASES = ("label", "label_name", "labelname", "name")
+_MILESTONE_INPUT_ALIASES = ("milestone", "milestone_title", "milestonetitle", "title")
 
 
 def resolve_skill_kwargs(inputs, args: dict | None, run_refs: dict | None,
                          test_args: dict | None = None) -> dict[str, Any]:
     """Build a skill's kwargs from, in priority: the run's REAL references (e.g. the actual
-    issues.list output), the planner's literal args, then the contract's sample test_args.
+    issues.list output, or the label/milestone subject the executor is ensuring), the
+    planner's literal args, then the contract's sample test_args.
 
     Used identically at synthesis-test time and at execution time, so a skill is tested with
     EXACTLY what it will be run with. The priority matters: the planner emits placeholders
@@ -159,6 +165,10 @@ def resolve_skill_kwargs(inputs, args: dict | None, run_refs: dict | None,
             kwargs[name] = run_refs[name]
         elif name in _LIST_INPUT_ALIASES and "issues" in run_refs:
             kwargs[name] = run_refs["issues"]
+        elif name in _LABEL_INPUT_ALIASES and "label" in run_refs:
+            kwargs[name] = run_refs["label"]
+        elif name in _MILESTONE_INPUT_ALIASES and "milestone" in run_refs:
+            kwargs[name] = run_refs["milestone"]
         elif name in args:
             kwargs[name] = args[name]
         elif name in test_args:

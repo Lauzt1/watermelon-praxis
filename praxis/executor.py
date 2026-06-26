@@ -17,6 +17,7 @@ from typing import Any
 
 from . import memory, operations, sandbox, synthesizer
 from .models import Step, StepResult
+from .platform.github import GitHubError
 
 # A synthesised skill is in-process and pure-ish; if it overruns this it's a runaway, not
 # slow I/O (effectful skills make a handful of fast calls). The watchdog turns that into a
@@ -79,6 +80,19 @@ class Executor:
             resp = self.client.rest_get(f"/repos/{repo}/issues", params=args.get("filters") or args or None)
             self.run_refs["issues"] = resp        # thread the list to a downstream compute step
             return resp
+
+        if op in ("labels.ensure", "milestones.ensure"):
+            # Compound + effectful: synthesised on first use, then run sandboxed. Seed the
+            # subject (label name / milestone title) into run_refs so the shared kwargs
+            # resolver maps the REAL subject onto whatever input name the contract chose,
+            # instead of falling back to the synthesis test placeholder.
+            kind = "label" if op == "labels.ensure" else "milestone"
+            subject = step.args.get(kind) or (step.args.get("labels") or [None])[0]
+            if subject is not None:
+                self.run_refs[kind] = subject
+            result = self._dispatch_skill(step)
+            self.run_refs[op] = result
+            return result
 
         if operations.is_compound(op):
             result = self._dispatch_skill(step)
@@ -157,64 +171,181 @@ class Executor:
     # --- run loop ---------------------------------------------------------------
 
     def run(self, run_id: int, steps: list[Step]) -> list[StepResult]:
-        results: list[StepResult] = []
-        completed_mutations: list[StepResult] = []  # done mutations, flipped on rollback
-        fatal = False
-        self.run_refs = {}          # fresh within-run reference scope
+        """Execute the planned steps in order. Before each step, learned precondition rules
+        inject prerequisite steps (e.g. labels.ensure) up front; a step that fails with a
+        discoverable constraint (a 422/404 on a bare enrichment op) is recovered once by
+        learning the rule, running the prerequisite, and retrying. Steps are numbered in
+        EXECUTION order so injected prerequisites and retries read naturally in the report."""
+        self.run_id = run_id
+        self.run_refs = {}           # fresh within-run reference scope
         self.synthesis_events = []   # fresh per-run synthesis log
+        self._results = []           # every executed / injected / skipped step result
+        self._completed = []         # done mutations, flipped to rolled_back on a fatal stop
+        self._meta = {}              # exec-seq -> (intent, operation, kind) for record_step
+        self._exec_seq = 0
+        self._fatal = False
 
+        executed: set[int] = set()
         for step in steps:
-            if fatal:
+            if self._fatal:
                 break
-            t0 = time.perf_counter()
-            self.client.journal = []
-            try:
-                self._dispatch(step)
-                latency = int((time.perf_counter() - t0) * 1000)
-            except Exception as e:  # noqa: BLE001 — any failure is classified, not swallowed
-                latency = int((time.perf_counter() - t0) * 1000)
-                memory.bump_op_stats(self.db, step.operation, success=False, latency_ms=latency)
-                if operations.is_enrichment(step.operation):
-                    results.append(StepResult(
-                        seq=step.seq, operation=step.operation, status="failed",
-                        latency_ms=latency, error=str(e),
-                        resolution="enrichment op failed; primary kept, continuing",
-                    ))
-                    continue
-                results.append(StepResult(
-                    seq=step.seq, operation=step.operation, status="failed",
-                    latency_ms=latency, error=str(e),
-                    resolution="fatal failure; rolled back this run's completed mutations",
-                ))
-                self._rollback(run_id)
-                for cr in completed_mutations:
-                    cr.status = "rolled_back"
-                fatal = True
-                continue
+            # pre-load learned preconditions: inject known prerequisites BEFORE the step
+            for prereq in self._precondition_steps(step):
+                if self._fatal:
+                    break
+                self._execute(prereq, planned=False)
+            if self._fatal:
+                break
+            self._execute(step, planned=True)
+            executed.add(id(step))
 
-            memory.bump_op_stats(self.db, step.operation, success=True, latency_ms=latency)
-            inverses = list(self.client.journal or [])
-            for inv in inverses:
-                memory.journal_append(self.db, run_id, step.seq, inv)
-            res = StepResult(seq=step.seq, operation=step.operation, status="done", latency_ms=latency)
-            results.append(res)
-            if inverses:
-                completed_mutations.append(res)
-
-        # steps that never ran after a fatal stop are reported as skipped
-        seen = {r.seq for r in results}
+        # planned steps that never ran (after a fatal stop) -> skipped
         for step in steps:
-            if step.seq not in seen:
-                results.append(StepResult(seq=step.seq, operation=step.operation, status="skipped"))
-        results.sort(key=lambda r: r.seq)
+            if id(step) not in executed:
+                self._exec_seq += 1
+                self._meta[self._exec_seq] = (step.intent, step.operation, step.kind)
+                self._results.append(StepResult(seq=self._exec_seq, operation=step.operation,
+                                                status="skipped"))
 
-        # persist per-step evidence with final statuses
-        by_seq = {r.seq: r for r in results}
-        for step in steps:
-            r = by_seq[step.seq]
-            memory.record_step(self.db, run_id, step.seq, step.intent, step.operation, step.kind,
+        self._results.sort(key=lambda r: r.seq)
+        for r in self._results:
+            intent, operation, kind = self._meta[r.seq]
+            memory.record_step(self.db, run_id, r.seq, intent, operation, kind,
                                r.status, r.latency_ms, r.error, r.resolution)
-        return results
+        return self._results
+
+    def _execute(self, step: Step, planned: bool) -> None:
+        """Dispatch one step (planned or injected), classify a failure, and — for a planned
+        step hitting a discoverable constraint — attempt the learn-and-retry recovery."""
+        res, inverses, error = self._dispatch_recorded(step)
+        if res.status == "done":
+            self._results.append(res)
+            if inverses:
+                self._completed.append(res)
+            return
+
+        self._results.append(res)                # the failure is always visible in the report
+        if planned and self._maybe_recover(step, error, res):
+            return
+        if not planned:                          # an injected prerequisite failing is non-fatal
+            res.resolution = res.resolution or "injected prerequisite failed; dependent step may fail"
+            return
+        if operations.is_enrichment(step.operation):
+            res.resolution = res.resolution or "enrichment op failed; primary kept, continuing"
+            return
+        res.resolution = "fatal failure; rolled back this run's completed mutations"
+        self._rollback(self.run_id)
+        for cr in self._completed:
+            cr.status = "rolled_back"
+        self._fatal = True
+
+    def _dispatch_recorded(self, step: Step):
+        """Dispatch one step; time it; bump op_stats; journal any inverses. Returns
+        (StepResult, inverses, error) — error is the raised exception, or None on success."""
+        self._exec_seq += 1
+        seq = self._exec_seq
+        self._meta[seq] = (step.intent, step.operation, step.kind)
+        t0 = time.perf_counter()
+        self.client.journal = []
+        try:
+            self._dispatch(step)
+        except Exception as e:  # noqa: BLE001 — classified by the caller, not swallowed
+            latency = int((time.perf_counter() - t0) * 1000)
+            memory.bump_op_stats(self.db, step.operation, success=False, latency_ms=latency)
+            return (StepResult(seq=seq, operation=step.operation, status="failed",
+                               latency_ms=latency, error=str(e)), [], e)
+        latency = int((time.perf_counter() - t0) * 1000)
+        memory.bump_op_stats(self.db, step.operation, success=True, latency_ms=latency)
+        inverses = list(self.client.journal or [])
+        for inv in inverses:
+            memory.journal_append(self.db, self.run_id, seq, inv)
+        res = StepResult(seq=seq, operation=step.operation, status="done", latency_ms=latency)
+        return res, inverses, None
+
+    # --- constraint pre-loading + learn-and-retry (spec §8, §9) -----------------
+
+    def _precondition_steps(self, step: Step) -> list[Step]:
+        """Prerequisite steps to inject before `step`, derived from its learned precondition
+        rules — this is the cross-run/cross-instruction transfer: a rule learned the hard way
+        once is pre-applied for free on every later run that touches the same operation."""
+        out: list[Step] = []
+        for rule in memory.rules_for(self.db, step.operation):
+            if rule["rule_type"] != "precondition":
+                continue
+            prereq = self._build_prerequisite(step, rule["detail"])
+            if prereq is not None:
+                out.append(prereq)
+        return out
+
+    def _build_prerequisite(self, step: Step, detail: dict) -> Step | None:
+        """Turn a precondition rule (e.g. {"action":"labels.ensure","param":"label"}) into a
+        concrete prerequisite step carrying the subject value from the dependent step's args."""
+        prereq_op = detail.get("action")
+        param = detail.get("param")
+        if not prereq_op or not param:
+            return None
+        subject = step.args.get(param)
+        if subject is None:                      # planner may have used the plural form
+            labels = step.args.get("labels")
+            if labels:
+                subject = labels[0]
+        if subject is None:
+            return None
+        return Step(seq=step.seq, intent=f"ensure prerequisite for {step.operation}",
+                    operation=prereq_op, kind="api", args={param: subject})
+
+    def _maybe_recover(self, step: Step, error, failed_res: StepResult) -> bool:
+        """A planned step failed; if it is a discoverable constraint (a 422/404 on a bare
+        enrichment op), learn the precondition rule, inject + run the prerequisite (synthesised
+        on first use), and retry the step once. Returns True iff fully handled here (the retry
+        succeeded, or the recovery turned fatal); False to fall through to the §9 class policy."""
+        rule = self._extract_constraint_rule(step.operation, error)
+        if rule is None:
+            return False
+        prereq_op = rule["action"]
+        # only attempt recovery if we can actually satisfy the prerequisite
+        if memory.get_skill(self.db, prereq_op) is None and self.synthesizer is None:
+            return False
+        if not self._has_rule(step.operation, "precondition", rule):
+            memory.add_rule(self.db, step.operation, "precondition", rule,
+                            learned_in_run=self.run_id)
+        failed_res.resolution = (
+            f"missing prerequisite (HTTP {getattr(error, 'status_code', '?')}); learned "
+            f"precondition rule -> {prereq_op}; pre-applied it and retried"
+        )
+        prereq = self._build_prerequisite(step, rule)
+        if prereq is None:
+            return False
+        self._execute(prereq, planned=False)
+        if self._fatal:
+            return True
+        last = self._results[-1]
+        if not (last.operation == prereq_op and last.status == "done"):
+            return False                         # couldn't satisfy the precondition
+        res, inverses, _ = self._dispatch_recorded(step)   # retry the original step once
+        res.resolution = f"retry after pre-applied {prereq_op}"
+        self._results.append(res)
+        if res.status == "done":
+            if inverses:
+                self._completed.append(res)
+            return True
+        return False
+
+    @staticmethod
+    def _extract_constraint_rule(op: str, error) -> dict | None:
+        """A discoverable precondition: a bare enrichment op failing with a 422/404 because its
+        subject (label/milestone) must exist first. Returns the rule detail, or None."""
+        if not isinstance(error, GitHubError) or error.status_code not in (404, 422):
+            return None
+        if op == "issues.add_label":
+            return {"action": "labels.ensure", "param": "label"}
+        if op == "issues.set_milestone":
+            return {"action": "milestones.ensure", "param": "milestone"}
+        return None
+
+    def _has_rule(self, operation: str, rule_type: str, detail: dict) -> bool:
+        return any(r["rule_type"] == rule_type and r["detail"] == detail
+                   for r in memory.rules_for(self.db, operation))
 
     # --- rollback ---------------------------------------------------------------
 

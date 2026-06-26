@@ -40,6 +40,16 @@ def test_resolve_skill_kwargs_falls_back_to_args_then_test_args():
     assert kw2 == {"threshold": 1, "issues": [7]}
 
 
+def test_resolve_skill_kwargs_maps_subject_onto_any_label_input_name():
+    # the executor seeds the real label under run_refs["label"]; a synthesised labels.ensure
+    # whose contract input the LLM named "name" (not "label") must still receive the REAL
+    # subject, never the safe test placeholder it was synthesised with.
+    inputs = {"name": "the label name to ensure"}
+    test_args = {"name": "praxis-synth-test"}
+    kw = resolve_skill_kwargs(inputs, {"label": "priority:high"}, {"label": "priority:high"}, test_args)
+    assert kw == {"name": "priority:high"}
+
+
 class StubLLM:
     """Replays queued payloads with the real LLM.complete semantics."""
 

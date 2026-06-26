@@ -151,6 +151,35 @@ def synthesis_pure_effectful_and_failure_paths():
 
 
 @check
+def executor_learns_then_preapplies_precondition():
+    # run 1: a bare add_label on a missing label 422s -> the precondition rule is learned and
+    # the label is created+retried. run 2 (same DB): the rule is pre-applied, zero 422s.
+    from praxis.executor import Executor
+    from tests.test_executor import LabelAwareClient, ensure_label_synth
+    with tempfile.TemporaryDirectory() as d:
+        conn = connect(Path(d) / "p.db")
+        try:
+            steps = [Step(seq=1, intent="c", operation="issues.create", kind="api", args={"title": "A"}),
+                     Step(seq=2, intent="l", operation="issues.add_label", kind="api", args={"label": "priority:high"})]
+            r1 = Executor(conn, LabelAwareClient(existing_labels={"bug"}),
+                          synthesizer=ensure_label_synth(conn)).run(run_id=1, steps=steps)
+            rules = memory.rules_for(conn, "issues.add_label")
+            assert any(rr["rule_type"] == "precondition" and rr["learned_in_run"] == 1 for rr in rules), \
+                "run 1 must learn the issues.add_label precondition rule"
+            assert any(s.operation == "issues.add_label" and s.status == "done" for s in r1), \
+                "add_label must succeed on the retry after labels.ensure"
+
+            client2 = LabelAwareClient(existing_labels={"bug"})
+            r2 = Executor(conn, client2, synthesizer=ensure_label_synth(conn)).run(run_id=2, steps=steps)
+            assert client2.label_422_count == 0, "run 2 pre-applies the rule -> zero 422s"
+            assert not any(s.status == "failed" for s in r2), "run 2 takes no failure"
+            ops = [s.operation for s in r2]
+            assert ops.index("labels.ensure") < ops.index("issues.add_label"), "ensure injected first"
+        finally:
+            conn.close()
+
+
+@check
 def reporter_renders():
     from praxis.reporter import build_report, render
     results = [StepResult(seq=1, operation="issues.create", status="done", latency_ms=5),

@@ -10,6 +10,135 @@ from praxis.models import SkillContract, Step
 from praxis.platform.github import GitHubError, inverse_of
 
 
+# The synthesised labels.ensure skill the Phase 3 tests register: resolve-or-create a label
+# using only allowed primitives + whitelisted builtins (no try/except — `Exception` isn't a
+# whitelisted builtin in the sandbox, so it lists-and-checks instead).
+ENSURE_LABEL_CODE = (
+    "def skill(client, label):\n"
+    "    existing = client.rest_get('/repos/' + client.repo + '/labels')\n"
+    "    for lab in existing:\n"
+    "        if lab['name'] == label:\n"
+    "            return lab\n"
+    "    return client.rest_post('/repos/' + client.repo + '/labels', json={'name': label})\n"
+)
+
+
+def ensure_label_synth(db):
+    """A stub synthesizer that registers the labels.ensure skill (no real LLM/API), so the
+    executor's constraint-retry can drive a real resolve-or-create against the fake client."""
+    contract = SkillContract(name="labels.ensure", inputs={"label": "the label name to ensure"},
+                             output="the label dict", primitives=["rest_get", "rest_post"],
+                             test_args={"label": "praxis-synth-test"})
+
+    def synth(step, refs=None):
+        memory.put_skill(db, step.operation, contract, ENSURE_LABEL_CODE)
+        return SimpleNamespace(ok=True, operation=step.operation, attempts=[])
+
+    return synth
+
+
+class LabelAwareClient:
+    """Models a repo where labels actually matter: adding a missing label 422s, and creating
+    a label makes a later add-label succeed. Lets the 422 -> labels.ensure -> retry path be
+    exercised end-to-end offline against the real inverse-derivation machinery."""
+
+    def __init__(self, existing_labels=("bug",), repo="o/r"):
+        self.repo = repo
+        self.api_calls = 0
+        self.journal = None
+        self.calls = []
+        self.labels = set(existing_labels)
+        self.label_422_count = 0
+        self._issue_no = 0
+
+    def _journaled(self, op, path, body, resp):
+        if self.journal is not None:
+            inv = inverse_of(op, path, body, resp)
+            if inv is not None:
+                self.journal.append(inv)
+        return resp
+
+    def rest_get(self, path, params=None):
+        self.api_calls += 1
+        self.calls.append({"op": "rest_get", "path": path, "body": None})
+        if path.endswith("/labels") and "/issues/" not in path:   # list repo labels
+            return [{"id": 100, "name": n} for n in sorted(self.labels)]
+        return []
+
+    def rest_post(self, path, json=None):
+        body = json or {}
+        self.api_calls += 1
+        self.calls.append({"op": "rest_post", "path": path, "body": body})
+        if path.endswith("/issues"):
+            self._issue_no += 1
+            return self._journaled("rest_post", path, body, {"number": self._issue_no})
+        if "/issues/" in path and path.endswith("/labels"):       # add labels to an issue
+            for n in body.get("labels", []):
+                if n not in self.labels:
+                    self.label_422_count += 1
+                    raise GitHubError(422, f"Label does not exist: {n}", "rest_post", path)
+            return self._journaled("rest_post", path, body, [{"name": n} for n in body.get("labels", [])])
+        if path.endswith("/labels"):                              # create a repo label
+            name = body.get("name")
+            self.labels.add(name)
+            return self._journaled("rest_post", path, body, {"id": 200, "name": name})
+        return self._journaled("rest_post", path, body, {})
+
+    def rest_patch(self, path, json=None):
+        self.api_calls += 1
+        self.calls.append({"op": "rest_patch", "path": path, "body": json or {}})
+        return self._journaled("rest_patch", path, json or {}, {})
+
+    def rest_delete(self, path, json=None):
+        self.api_calls += 1
+        self.calls.append({"op": "rest_delete", "path": path, "body": json or {}})
+        return self._journaled("rest_delete", path, json or {}, {})
+
+
+def test_add_label_422_learns_precondition_rule_and_retries_via_ensure(db):
+    # run 1: a bare add_label on a missing label 422s -> the executor extracts the
+    # precondition rule, persists it (learned_in_run=1), injects + synthesises labels.ensure,
+    # then retries the add_label once and succeeds.
+    client = LabelAwareClient(existing_labels={"bug"})            # priority:high is missing
+    ex = Executor(db, client, synthesizer=ensure_label_synth(db))
+    steps = [
+        Step(seq=1, intent="create", operation="issues.create", kind="api", args={"title": "Login bug"}),
+        Step(seq=2, intent="label", operation="issues.add_label", kind="api", args={"label": "priority:high"}),
+    ]
+    results = ex.run(run_id=1, steps=steps)
+
+    rules = memory.rules_for(db, "issues.add_label")
+    assert any(r["rule_type"] == "precondition" and r["detail"]["action"] == "labels.ensure"
+               and r["detail"]["param"] == "label" and r["learned_in_run"] == 1
+               for r in rules), "the issues.add_label precondition rule must be learned in run 1"
+    assert "priority:high" in client.labels, "labels.ensure must have created the missing label"
+    assert any(r.operation == "labels.ensure" and r.status == "done" for r in results), \
+        "a labels.ensure step must have been injected and run"
+    add_results = [r for r in results if r.operation == "issues.add_label"]
+    assert any(r.status == "done" for r in add_results), "add_label must succeed on the retry"
+    assert ex.synthesis_events and ex.synthesis_events[0]["operation"] == "labels.ensure"
+
+
+def test_known_precondition_preapplies_ensure_before_add_label(db):
+    # run 2 (a second executor): the rule is already in learned_rules, so labels.ensure is
+    # injected BEFORE the bare add_label and the run takes zero 422s.
+    memory.add_rule(db, "issues.add_label", "precondition",
+                    {"action": "labels.ensure", "param": "label"}, learned_in_run=1)
+    client = LabelAwareClient(existing_labels={"bug"})            # priority:high still missing
+    ex = Executor(db, client, synthesizer=ensure_label_synth(db))
+    steps = [
+        Step(seq=1, intent="create", operation="issues.create", kind="api", args={"title": "X"}),
+        Step(seq=2, intent="label", operation="issues.add_label", kind="api", args={"label": "priority:high"}),
+    ]
+    results = ex.run(run_id=2, steps=steps)
+
+    assert client.label_422_count == 0, "a pre-applied precondition must avoid the 422 entirely"
+    assert not any(r.status == "failed" for r in results), "no failures when the rule is pre-applied"
+    ops = [r.operation for r in results]
+    assert "labels.ensure" in ops and ops.index("labels.ensure") < ops.index("issues.add_label"), \
+        "labels.ensure must be injected before issues.add_label"
+
+
 class FakeClient:
     """Behaves like praxis.platform.github.GitHub for the executor's purposes."""
 
