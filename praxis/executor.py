@@ -42,6 +42,8 @@ class Executor:
         self.run_refs: dict[str, Any] = {}
         # Synthesis events recorded this run, surfaced by the reporter.
         self.synthesis_events: list[dict[str, Any]] = []
+        # Learned precondition rules pre-applied this run (the cross-run transfer evidence).
+        self.preapplied_rules: list[dict[str, Any]] = []
 
     # --- dispatch ---------------------------------------------------------------
 
@@ -188,6 +190,7 @@ class Executor:
         self.run_id = run_id
         self.run_refs = {}           # fresh within-run reference scope
         self.synthesis_events = []   # fresh per-run synthesis log
+        self.preapplied_rules = []   # fresh per-run pre-applied-rule log
         self._results = []           # every executed / injected / skipped step result
         self._completed = []         # done mutations, flipped to rolled_back on a fatal stop
         self._meta = {}              # exec-seq -> (intent, operation, kind) for record_step
@@ -284,6 +287,12 @@ class Executor:
             prereq = self._build_prerequisite(step, rule["detail"])
             if prereq is not None:
                 out.append(prereq)
+                self.preapplied_rules.append({
+                    "operation": step.operation,
+                    "action": rule["detail"].get("action"),
+                    "param": rule["detail"].get("param"),
+                    "learned_in_run": rule["learned_in_run"],
+                })
         return out
 
     def _build_prerequisite(self, step: Step, detail: dict) -> Step | None:

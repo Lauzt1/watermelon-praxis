@@ -67,5 +67,12 @@ VOCABULARY_HELP = (
     "                         compute.group_by_label_and_render_table (kind: compute)\n"
     "\nDo NOT emit labels.ensure, milestones.ensure, or any operation not listed above. "
     "Add labels and milestones DIRECTLY with issues.add_label / issues.set_milestone; "
-    "the agent ensures prerequisites (creating a missing label/milestone) automatically."
+    "the agent ensures prerequisites (creating a missing label/milestone) automatically.\n"
+    "Label/milestone rules:\n"
+    "  - issues.create args carry ONLY title, body, assignees - NEVER a labels or milestone "
+    "key. Labels and milestones are added as their own later steps.\n"
+    "  - Emit exactly ONE label per issues.add_label step (one label = one step), with the "
+    'label name in args as {"label": "<name>"}.\n'
+    "  - Use canonical label names: a high-priority issue gets the label `priority:high`; an "
+    "urgent one `priority:urgent`; a plain bug gets `bug`."
 )

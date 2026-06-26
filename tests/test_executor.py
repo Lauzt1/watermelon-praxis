@@ -119,6 +119,36 @@ def test_add_label_422_learns_precondition_rule_and_retries_via_ensure(db):
     assert ex.synthesis_events and ex.synthesis_events[0]["operation"] == "labels.ensure"
 
 
+def test_preapplied_precondition_is_recorded_for_the_report(db):
+    # when a rule is already known, the executor records that it pre-applied it (with the run
+    # it was learned in), so the report can state "pre-applied rule (learned run #1)".
+    memory.add_rule(db, "issues.add_label", "precondition",
+                    {"action": "labels.ensure", "param": "label"}, learned_in_run=1)
+    client = LabelAwareClient(existing_labels={"bug", "priority:high"})
+    ex = Executor(db, client, synthesizer=ensure_label_synth(db))
+    steps = [
+        Step(seq=1, intent="create", operation="issues.create", kind="api", args={"title": "X"}),
+        Step(seq=2, intent="label", operation="issues.add_label", kind="api", args={"label": "priority:high"}),
+    ]
+    ex.run(run_id=2, steps=steps)
+    assert ex.preapplied_rules == [
+        {"operation": "issues.add_label", "action": "labels.ensure",
+         "param": "label", "learned_in_run": 1}
+    ]
+
+
+def test_run_one_does_not_record_a_preapplied_rule_when_learning_fresh(db):
+    # run 1 LEARNS the rule mid-run (it isn't pre-applied), so preapplied_rules stays empty.
+    client = LabelAwareClient(existing_labels={"bug"})
+    ex = Executor(db, client, synthesizer=ensure_label_synth(db))
+    steps = [
+        Step(seq=1, intent="create", operation="issues.create", kind="api", args={"title": "X"}),
+        Step(seq=2, intent="label", operation="issues.add_label", kind="api", args={"label": "priority:high"}),
+    ]
+    ex.run(run_id=1, steps=steps)
+    assert ex.preapplied_rules == []
+
+
 def test_labels_ensure_caches_id_then_serves_from_ref_cache(db):
     # run 1: labels.ensure resolves/creates priority:high and caches its id (resolve-once).
     memory.add_rule(db, "issues.add_label", "precondition",

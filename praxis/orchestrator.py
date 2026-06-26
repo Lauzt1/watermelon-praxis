@@ -39,6 +39,7 @@ class Orchestrator:
             "plan_reused": had_cached_plan,
             "plan_stored": not had_cached_plan,
             "skills_synthesized": synthesized,
+            "preapplied_rules": executor.preapplied_rules,
         }
         report = build_report(
             instruction, results,

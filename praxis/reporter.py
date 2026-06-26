@@ -67,7 +67,15 @@ def render(report: Report) -> str:
         f"wall_ms={m.get('wall_ms')} failure_count={m.get('failure_count')}",
     ]
     if report.memory_delta:
-        lines.append("Memory delta: " + " ".join(f"{k}={v}" for k, v in report.memory_delta.items()))
+        delta = report.memory_delta
+        preapplied = delta.get("preapplied_rules") or []
+        # the cross-run/cross-instruction transfer, stated plainly (the headline in the report)
+        for pr in preapplied:
+            lines.append(f"Pre-applied rule (learned run #{pr.get('learned_in_run')}): "
+                         f"{pr.get('operation')} -> {pr.get('action')}")
+        rest = {k: v for k, v in delta.items() if k != "preapplied_rules"}
+        if rest:
+            lines.append("Memory delta: " + " ".join(f"{k}={v}" for k, v in rest.items()))
     if report.synthesis_events:
         lines.append(f"Synthesis: {len(report.synthesis_events)} event(s)")
         for ev in report.synthesis_events:

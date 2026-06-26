@@ -224,6 +224,18 @@ def reporter_renders():
     assert "issues.create" in text and "Metrics" in text, "render missing content"
     assert rep.status == "partial", "synthetic enrichment failure should be partial"
 
+
+@check
+def reporter_states_preapplied_rule():
+    from praxis.reporter import build_report, render
+    rep = build_report("demo", [StepResult(seq=1, operation="issues.add_label", status="done")],
+                       api_calls=1, llm_calls=0, wall_ms=5,
+                       memory_delta={"preapplied_rules": [
+                           {"operation": "issues.add_label", "action": "labels.ensure",
+                            "param": "label", "learned_in_run": 1}]})
+    text = render(rep).lower()
+    assert "pre-applied rule (learned run #1)" in text, "report must state the transferred rule"
+
 def main():
     failed = 0
     for fn in CHECKS:
