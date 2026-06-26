@@ -11,6 +11,7 @@ Two paths, by design (spec §5):
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from typing import Any
 
@@ -36,6 +37,12 @@ def _normalise(instruction: str) -> str:
 def exact_hash(instruction: str) -> str:
     """Stable sha256 of the case/whitespace-normalised instruction — the fast path."""
     return hashlib.sha256(_normalise(instruction).encode("utf-8")).hexdigest()
+
+
+def signature_key(signature: dict[str, Any]) -> str:
+    """Deterministic string key for a signature dict — used for `plans.signature`
+    lookup and `runs.signature_json`, so equivalent signatures collide on the same row."""
+    return json.dumps(signature, sort_keys=True)
 
 
 def signature(instruction: str, llm: Any) -> dict[str, Any]:
