@@ -28,6 +28,11 @@ from .sandbox import compile_skill, run_skill
 
 MAX_ATTEMPTS = 3
 TEST_TIMEOUT_S = 8.0
+# The workhorse is a REASONING model: its chain-of-thought counts against max_tokens and
+# can be several thousand tokens before the actual answer. Budget generously or `.content`
+# comes back empty (the spec's reasoning-model gotcha). Contract is small JSON; code is larger.
+CONTRACT_MAX_TOKENS = 6000
+CODE_MAX_TOKENS = 8000
 
 # The only platform primitives a skill may compose (spec §7 step 2). Pinned here; the
 # prompt body around it is tuned against the live model.
@@ -89,6 +94,12 @@ def _code_messages(contract: SkillContract, client: Any, prior_error: str | None
         "NO imports, NO open/eval/exec, NO file or network access except through `client`, "
         "NO dunder attribute access. The kwargs are exactly the contract inputs. "
         "Return the result described by the contract. "
+        # The real GitHub REST shapes the model must not get wrong — labels/assignees/
+        # milestone are OBJECTS, not strings, on a fetched issue.
+        "IMPORTANT — real GitHub issue JSON shape: an issue is a dict with keys including "
+        "'number' (int), 'title' (str), 'html_url' (str), 'assignee' (object|null), and "
+        "'labels' (a LIST OF OBJECTS, each like {'name': 'bug', ...}). So to group by label "
+        "use label['name'] (a string) as the key — NEVER the label object itself. "
         "Output ONLY the function source code — no markdown fences, no prose."
     )
     user = (
@@ -126,11 +137,43 @@ def _replay_inverse(client: Any, inv: InverseOp) -> None:
         client.rest_post(inv.path, json=inv.body)
 
 
-def _test_skill(fn: Callable, gap: Step, contract: SkillContract, client: Any) -> Any:
-    """Pure compute -> run in-memory (no client). Effectful -> run against the real client,
-    capture its inverse ops in the journal, then replay them to self-clean."""
+# input names a transform conventionally uses for "the list it operates on"
+_LIST_INPUT_ALIASES = ("issues", "items", "rows", "data", "results")
+
+
+def resolve_skill_kwargs(inputs, args: dict | None, run_refs: dict | None,
+                         test_args: dict | None = None) -> dict[str, Any]:
+    """Build a skill's kwargs from, in priority: the run's REAL references (e.g. the actual
+    issues.list output), the planner's literal args, then the contract's sample test_args.
+
+    Used identically at synthesis-test time and at execution time, so a skill is tested with
+    EXACTLY what it will be run with. The priority matters: the planner emits placeholders
+    like "$steps.1.result" for data it can't know at plan time, so real run data must win —
+    otherwise the skill iterates the placeholder string and crashes on real data only."""
+    args = args or {}
+    run_refs = run_refs or {}
+    test_args = test_args or {}
+    kwargs: dict[str, Any] = {}
+    for name in inputs:
+        if name in run_refs:
+            kwargs[name] = run_refs[name]
+        elif name in _LIST_INPUT_ALIASES and "issues" in run_refs:
+            kwargs[name] = run_refs["issues"]
+        elif name in args:
+            kwargs[name] = args[name]
+        elif name in test_args:
+            kwargs[name] = test_args[name]
+    return kwargs
+
+
+def _test_skill(fn: Callable, gap: Step, contract: SkillContract, client: Any,
+                run_refs: dict | None = None) -> Any:
+    """Pure compute -> run in-memory (no client) against the SAME kwargs execution will use
+    (real upstream data when available). Effectful -> run against the real client, capture
+    its inverse ops in the journal, then replay them to self-clean."""
     if operations.is_compute(gap.operation):
-        result = run_skill(fn, client=None, kwargs=contract.test_args, timeout_s=TEST_TIMEOUT_S)
+        kwargs = resolve_skill_kwargs(contract.inputs, gap.args, run_refs, contract.test_args)
+        result = run_skill(fn, client=None, kwargs=kwargs, timeout_s=TEST_TIMEOUT_S)
         if result is None:
             raise SynthesisError("pure transform returned None on its test args")
         return result
@@ -154,14 +197,21 @@ def _test_skill(fn: Callable, gap: Step, contract: SkillContract, client: Any) -
 
 # --- the loop -------------------------------------------------------------------------
 
-def synthesize(gap: Step, client: Any, db, llm, max_attempts: int = MAX_ATTEMPTS) -> SynthesisResult:
+def synthesize(gap: Step, client: Any, db, llm, run_refs: dict | None = None,
+               max_attempts: int = MAX_ATTEMPTS) -> SynthesisResult:
     """Reason a contract once, then up to `max_attempts` generate->compile->test cycles.
-    Register on the first success; otherwise return a structured failure."""
+    `run_refs` (the executor's within-run references) lets a pure transform be tested
+    against the run's real upstream data. Register on the first success; otherwise return a
+    structured failure."""
     workhorse = llm.config.model_workhorse
-    contract: SkillContract = llm.complete(
-        _contract_messages(gap, client), model=workhorse,
-        schema=SkillContract, max_tokens=2000, json_mode=True,
-    )
+    try:
+        contract: SkillContract = llm.complete(
+            _contract_messages(gap, client), model=workhorse,
+            schema=SkillContract, max_tokens=CONTRACT_MAX_TOKENS, json_mode=True,
+        )
+    except Exception as e:  # noqa: BLE001 — a bad/empty contract is a clean failure, not a crash
+        return SynthesisResult(ok=False, operation=gap.operation,
+                               attempts=[f"contract: {type(e).__name__}: {e}"])
     # the contract name is the join key the executor looks up by — pin it to the operation
     if contract.name != gap.operation:
         contract = contract.model_copy(update={"name": gap.operation})
@@ -169,14 +219,14 @@ def synthesize(gap: Step, client: Any, db, llm, max_attempts: int = MAX_ATTEMPTS
     attempts: list[str] = []
     prior_error: str | None = None
     for i in range(max_attempts):
-        raw = llm.complete(
-            _code_messages(contract, client, prior_error), model=workhorse,
-            max_tokens=2000, json_mode=False,
-        )
-        code = _strip_fences(raw)
         try:
+            raw = llm.complete(
+                _code_messages(contract, client, prior_error), model=workhorse,
+                max_tokens=CODE_MAX_TOKENS, json_mode=False,
+            )
+            code = _strip_fences(raw)
             fn = compile_skill(code)
-            _test_skill(fn, gap, contract, client)
+            _test_skill(fn, gap, contract, client, run_refs)
         except Exception as e:  # noqa: BLE001 — every attempt error is reported, not raised
             prior_error = f"{type(e).__name__}: {e}"
             attempts.append(f"attempt {i + 1}: {prior_error}")

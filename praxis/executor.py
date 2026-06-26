@@ -15,7 +15,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from . import memory, operations, sandbox
+from . import memory, operations, sandbox, synthesizer
 from .models import Step, StepResult
 
 # A synthesised skill is in-process and pure-ish; if it overruns this it's a runaway, not
@@ -89,10 +89,22 @@ class Executor:
 
         raise ExecutorError(f"unknown operation {op!r}")
 
+    @staticmethod
+    def _looks_like_placeholder(text: str) -> bool:
+        """A lone data-flow placeholder the planner emitted for the body, e.g.
+        "$steps.2.result", "{{ table }}", "ctx:result", "<table>" — to be replaced, not kept."""
+        t = (text or "").strip()
+        if not t:
+            return True
+        if t.startswith("$") or t.startswith("ctx:"):
+            return True
+        return any(t.startswith(a) and t.endswith(b)
+                   for a, b in (("{{", "}}"), ("{", "}"), ("<", ">"), ("[", "]")))
+
     def _thread_compute_result(self, body: dict) -> dict:
         """If a compute transform produced text this run, fold it into the issue body. The
-        planner can't embed a runtime-computed table, so the executor appends it (after any
-        prose the planner wrote) — this is what makes the triage issue actually list them."""
+        planner can't embed a runtime-computed table, so the executor injects it: a lone
+        placeholder body is replaced; real prose is kept and the table appended."""
         result = self.run_refs.get("result")
         if not isinstance(result, str) or not result.strip():
             return body
@@ -100,7 +112,10 @@ class Executor:
         if result in existing:
             return body
         body = dict(body)
-        body["body"] = (existing.rstrip() + "\n\n" + result).strip() if existing else result
+        if self._looks_like_placeholder(existing):
+            body["body"] = result
+        else:
+            body["body"] = (existing.rstrip() + "\n\n" + result).strip()
         return body
 
     def _dispatch_skill(self, step: Step) -> Any:
@@ -111,7 +126,8 @@ class Executor:
                 raise ExecutorError(
                     f"no registered skill for {step.operation!r} and no synthesizer"
                 )
-            result = self.synthesizer(step)       # reason -> build -> test -> register
+            # pass the run's references so a pure transform is tested on real upstream data
+            result = self.synthesizer(step, self.run_refs)  # reason -> build -> test -> register
             self.synthesis_events.append({
                 "operation": step.operation,
                 "ok": bool(getattr(result, "ok", False)),
@@ -131,18 +147,12 @@ class Executor:
         return sandbox.run_skill(fn, client=self.client, kwargs=kwargs, timeout_s=SKILL_TIMEOUT_S)
 
     def _skill_kwargs(self, step: Step, contract: dict | None) -> dict[str, Any]:
-        """Build the skill's kwargs: planner-supplied literals first, then fill any declared
-        input from this run's references (e.g. the `issues` a compute transform consumes)."""
-        inputs = (contract or {}).get("inputs", {}) if isinstance(contract, dict) else {}
-        kwargs: dict[str, Any] = dict(step.args or {})
-        for name in inputs:
-            if name in kwargs:
-                continue
-            if name in self.run_refs:
-                kwargs[name] = self.run_refs[name]
-            elif name in ("issues", "items", "rows", "data", "results") and "issues" in self.run_refs:
-                kwargs[name] = self.run_refs["issues"]
-        return kwargs
+        """Build the skill's kwargs via the shared resolver — real run references outrank the
+        planner's placeholder args — so the skill runs on the same inputs it was tested with."""
+        contract = contract if isinstance(contract, dict) else {}
+        return synthesizer.resolve_skill_kwargs(
+            contract.get("inputs", {}), step.args, self.run_refs, contract.get("test_args", {})
+        )
 
     # --- run loop ---------------------------------------------------------------
 

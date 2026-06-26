@@ -15,8 +15,29 @@ from types import SimpleNamespace
 
 from praxis import memory
 from praxis.models import Step
-from praxis.synthesizer import synthesize
+from praxis.synthesizer import resolve_skill_kwargs, synthesize
 from tests.test_executor import FakeClient
+
+
+def test_resolve_skill_kwargs_prefers_real_run_data_over_planner_placeholder():
+    # the planner emits a placeholder like "$steps.1.result"; the real upstream data in
+    # run_refs MUST win, or the skill iterates the placeholder string and crashes.
+    inputs = {"issues": "list of issue dicts"}
+    args = {"issues": "$steps.1.result"}              # planner placeholder (a string)
+    run_refs = {"issues": [{"number": 1, "labels": [{"name": "bug"}]}]}
+    test_args = {"issues": [{"number": 99}]}
+    kw = resolve_skill_kwargs(inputs, args, run_refs, test_args)
+    assert kw == {"issues": [{"number": 1, "labels": [{"name": "bug"}]}]}
+
+
+def test_resolve_skill_kwargs_falls_back_to_args_then_test_args():
+    inputs = {"threshold": "int", "issues": "list"}
+    # threshold isn't a runtime ref -> use the planner literal; issues -> run data
+    kw = resolve_skill_kwargs(inputs, {"threshold": 5}, {"issues": [1]}, {"threshold": 1, "issues": []})
+    assert kw == {"threshold": 5, "issues": [1]}
+    # nothing in run_refs/args -> contract sample is the last resort
+    kw2 = resolve_skill_kwargs(inputs, {}, {}, {"threshold": 1, "issues": [7]})
+    assert kw2 == {"threshold": 1, "issues": [7]}
 
 
 class StubLLM:
@@ -105,6 +126,40 @@ def test_effectful_synthesis_self_cleans_and_registers(db):
     assert client.undo_applied, "effectful synthesis test must self-clean via the journal"
     # after self-clean the journal must not leak into a caller's run
     assert client.journal is None
+
+
+def test_pure_skill_is_tested_against_real_run_data_when_available(db):
+    # The LLM's own test_args use string labels, but real GitHub issues carry labels as
+    # objects ({"name": ...}). Testing against the real upstream data (run_refs) must catch
+    # a skill that treats the label object as a hashable key, and force a corrected retry.
+    gap = Step(seq=1, intent="group", operation="compute.group_by_label_and_render_table",
+               kind="compute", args={})
+    buggy = (  # uses the whole label object as a dict key -> crashes on real data
+        "def skill(client, issues):\n"
+        "    groups = {}\n"
+        "    for it in issues:\n"
+        "        for lab in it.get('labels', []):\n"
+        "            groups.setdefault(lab, []).append(it.get('title'))\n"
+        "    return str(sorted(groups))\n"
+    )
+    fixed = (  # reads the label name -> works on real data
+        "def skill(client, issues):\n"
+        "    groups = {}\n"
+        "    for it in issues:\n"
+        "        for lab in it.get('labels', []):\n"
+        "            name = lab['name'] if isinstance(lab, dict) else lab\n"
+        "            groups.setdefault(name, []).append(it.get('title'))\n"
+        "    return '| label |\\n' + '\\n'.join(sorted(groups))\n"
+    )
+    real_issues = [
+        {"number": 1, "title": "A", "labels": [{"name": "bug"}]},
+        {"number": 2, "title": "B", "labels": [{"name": "bug"}, {"name": "ui"}]},
+    ]
+    llm = StubLLM([PURE_CONTRACT, buggy, fixed])
+    result = synthesize(gap, FakeClient(), db, llm, run_refs={"issues": real_issues})
+    assert result.ok, f"expected the corrected retry to register, attempts={result.attempts}"
+    assert "lab['name']" in result.code, "buggy attempt must be rejected, fixed one registered"
+    assert llm.llm_calls == 3, "contract + buggy attempt (caught) + fixed attempt"
 
 
 def test_three_compile_failures_report_cleanly_without_registering(db):

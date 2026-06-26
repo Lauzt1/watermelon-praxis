@@ -22,9 +22,9 @@ def cmd_run(args: argparse.Namespace, config: Config) -> None:
     conn = connect(config.db_path)
     client = GitHub(config.github_token, config.github_repo)
     llm = LLM(config)
-    # Bridge the executor's self.synthesizer(step) call to the canonical
-    # synthesize(gap, client, db, llm); the closure binds the live client/db/llm.
-    synthesizer = lambda step: synthesize(step, client, conn, llm)  # noqa: E731
+    # Bridge the executor's self.synthesizer(step, run_refs) call to the canonical
+    # synthesize(gap, client, db, llm, run_refs); the closure binds the live client/db/llm.
+    synthesizer = lambda step, refs=None: synthesize(step, client, conn, llm, run_refs=refs)  # noqa: E731
     try:
         report = Orchestrator(conn, client, llm, synthesizer=synthesizer).run(args.instruction)
         print(report.model_dump_json(indent=2) if args.json else render(report))

@@ -167,7 +167,7 @@ def test_compute_op_synthesises_then_runs(db):
     client = FakeClient()
     code = "def skill(client, issues):\n    return 'TABLE rows=' + str(len(issues))"
 
-    def fake_synth(step):
+    def fake_synth(step, refs=None):
         memory.put_skill(db, step.operation, _compute_contract(step.operation), code)
         return SimpleNamespace(ok=True, operation=step.operation, attempts=[])
 
@@ -189,7 +189,7 @@ def test_compute_op_reuses_registered_skill_without_synthesising(db):
                      _compute_contract("compute.group_by_label_and_render_table"),
                      "def skill(client, issues):\n    return len(issues)")
 
-    def boom(step):
+    def boom(step, refs=None):
         raise AssertionError("must not synthesize when a skill is already registered")
 
     steps = [
@@ -224,10 +224,30 @@ def test_create_body_includes_latest_compute_result(db):
     assert "Open unassigned issues by label:" in create[0]["body"]["body"], "planner text kept"
 
 
+def test_create_body_placeholder_is_replaced_by_compute_result(db):
+    # the planner often emits a lone data-flow placeholder for the body ("$steps.2.result"
+    # / "{{ table }}"); the executor must REPLACE it with the table, not prepend the junk.
+    client = FakeClient()
+    memory.put_skill(db, "compute.group_by_label_and_render_table",
+                     _compute_contract("compute.group_by_label_and_render_table"),
+                     "def skill(client, issues):\n    return '| label |\\n| bug |'")
+    steps = [
+        Step(seq=1, intent="list", operation="issues.list", kind="api", args={}),
+        Step(seq=2, intent="group", operation="compute.group_by_label_and_render_table",
+             kind="compute", args={}),
+        Step(seq=3, intent="summary", operation="issues.create", kind="api",
+             args={"title": "Triage", "body": "$steps.2.result"}),
+    ]
+    Executor(db, client).run(run_id=1, steps=steps)
+    create = [c for c in client.calls if c["op"] == "rest_post" and c["path"].endswith("/issues")]
+    body = create[0]["body"]["body"]
+    assert "| label |" in body and "$steps.2.result" not in body, "placeholder must be replaced"
+
+
 def test_compute_op_failed_synthesis_is_fatal(db):
     client = FakeClient()
 
-    def failing_synth(step):
+    def failing_synth(step, refs=None):
         return SimpleNamespace(ok=False, operation=step.operation,
                                attempts=["e1", "e2", "e3"])
 
