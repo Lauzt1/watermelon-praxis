@@ -310,6 +310,41 @@ def reporter_states_preapplied_rule():
     text = render(rep).lower()
     assert "pre-applied rule (learned run #1)" in text, "report must state the transferred rule"
 
+@check
+def compaction_trims_steps_and_preserves_runs_and_stats():
+    # Phase 5: compaction trims the bulky per-step audit trail but keeps every `runs` row, so
+    # the stats/curve learning ledger (which reads `runs`, not `run_steps`) is byte-identical.
+    from praxis import metrics
+    from praxis.compactor import compact
+    sig = {"verb": "create", "entity": "issue", "filters": {}, "artifact": "bug"}
+    with tempfile.TemporaryDirectory() as d:
+        conn = connect(Path(d) / "c.db")
+        try:
+            for _ in range(4):
+                rid = memory.start_run(conn, "create a bug issue", sig)
+                for s in (1, 2, 3):
+                    memory.record_step(conn, rid, seq=s, intent="x", operation="issues.create",
+                                       kind="api", status="done", latency_ms=5)
+                    memory.bump_op_stats(conn, "issues.create", success=True, latency_ms=5)
+                memory.finish_run(conn, rid, status="ok", api_calls=3, llm_calls=0,
+                                  wall_ms=9, failure_count=0)
+            before_steps = conn.execute("SELECT COUNT(*) c FROM run_steps").fetchone()["c"]
+            before_stats = metrics.render_stats("i", metrics.runs_for_signature(conn, sig))
+            before_ops = memory.all_op_stats(conn, "issues.create")[0]
+
+            result = compact(conn, keep_recent=1)
+
+            after_steps = conn.execute("SELECT COUNT(*) c FROM run_steps").fetchone()["c"]
+            assert after_steps < before_steps, "compaction must trim run_steps"
+            assert result["runs_before"] == result["runs_after"] == 4, "all runs retained"
+            after_stats = metrics.render_stats("i", metrics.runs_for_signature(conn, sig))
+            assert after_stats == before_stats, "stats unchanged for retained runs"
+            assert memory.all_op_stats(conn, "issues.create")[0] == before_ops, \
+                "op_stats is authoritative — compaction must not recompute it"
+        finally:
+            conn.close()
+
+
 def main():
     failed = 0
     for fn in CHECKS:

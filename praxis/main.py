@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 
 from pathlib import Path
 
-from . import memory, metrics, recall, seeding
+from . import compactor, memory, metrics, recall, seeding
 from .config import Config, load
 from .db import connect
 from .llm import LLM
@@ -157,6 +158,39 @@ def cmd_curve(args: argparse.Namespace, config: Config) -> None:
         conn.close()
 
 
+def _recall_latency_ms(conn, repeats: int = 5) -> float:
+    """A representative memory-recall read: a full scan of the per-step audit trail (the table
+    compaction trims). Best-of-`repeats` to damp OS/cache jitter; reported before/after so the
+    demo shows compaction making recall cheaper."""
+    best = float("inf")
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        conn.execute(
+            "SELECT run_id, seq, operation, kind, status, latency_ms FROM run_steps "
+            "ORDER BY run_id, seq"
+        ).fetchall()
+        best = min(best, (time.perf_counter() - t0) * 1000)
+    return best
+
+
+def cmd_compact(args: argparse.Namespace, config: Config) -> None:
+    conn = connect(config.db_path)
+    try:
+        before_latency = _recall_latency_ms(conn)
+        result = compactor.compact(conn, keep_recent=args.keep_recent)
+        after_latency = _recall_latency_ms(conn)
+        print(f"compact: kept the {result['keep_recent']} most recent run(s); "
+              f"compacted {result['runs_compacted']} older run(s)")
+        print(f"  run_steps : {result['run_steps_before']} -> {result['run_steps_after']} "
+              f"(-{result['run_steps_trimmed']})")
+        print(f"  runs      : {result['runs_before']} -> {result['runs_after']} (retained)")
+        print(f"  plans     : {result['plans_preserved']} reconstructed for compacted runs")
+        print(f"  recall    : {before_latency:.3f} ms -> {after_latency:.3f} ms "
+              f"(full run_steps scan, best of 5)")
+    finally:
+        conn.close()
+
+
 def cmd_doctor(args: argparse.Namespace, config: Config) -> None:
     ok = True
 
@@ -226,6 +260,10 @@ def main(argv: list[str] | None = None) -> None:
     p_curve = sub.add_parser("curve", help="export a learning-curve CSV + SVG for an instruction")
     p_curve.add_argument("instruction", help="the instruction (matched by signature)")
 
+    p_compact = sub.add_parser("compact", help="trim old run_steps; keep runs/op_stats authoritative")
+    p_compact.add_argument("--keep-recent", type=int, default=50,
+                           help="how many most-recent runs keep their step detail (default 50)")
+
     args = parser.parse_args(argv)
     if args.command == "run":
         cmd_run(args, config)
@@ -241,6 +279,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_stats(args, config)
     elif args.command == "curve":
         cmd_curve(args, config)
+    elif args.command == "compact":
+        cmd_compact(args, config)
 
 
 if __name__ == "__main__":
