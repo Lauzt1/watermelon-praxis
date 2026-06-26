@@ -1,6 +1,7 @@
 """Offline self-check: no network, no API keys. Exit non-zero on any failure."""
 import sys, tempfile
 from pathlib import Path
+from praxis import memory
 from praxis.db import connect
 from praxis.models import Step, Plan, Report, StepResult
 from praxis.platform.github import inverse_of
@@ -43,6 +44,24 @@ def inverse_of_roundtrips_five_shapes():
     # reads / unknown mutations -> None
     assert inverse_of("rest_get", "/repos/o/r/issues", None, [{"number": 1}]) is None
     assert inverse_of("rest_patch", "/repos/o/r/issues/42", {"title": "x"}, {"number": 42}) is None
+
+@check
+def memory_roundtrips():
+    with tempfile.TemporaryDirectory() as d:
+        conn = connect(Path(d) / "m.db")
+        try:
+            rid = memory.start_run(conn, "inst", {"verb": "create"})
+            memory.record_step(conn, rid, seq=1, intent="x", operation="issues.create",
+                               kind="api", status="done", latency_ms=5)
+            memory.finish_run(conn, rid, status="ok", api_calls=1, llm_calls=1, wall_ms=9, failure_count=0)
+            row = conn.execute("SELECT status, api_calls FROM runs WHERE id=?", (rid,)).fetchone()
+            assert row["status"] == "ok" and row["api_calls"] == 1, "run not persisted"
+            # ref_cache miss then hit
+            assert memory.get_ref(conn, "label:bug") is None, "expected cache miss"
+            memory.put_ref(conn, "label:bug", "label", "LA_1", run_id=rid)
+            assert memory.get_ref(conn, "label:bug") == "LA_1", "expected cache hit"
+        finally:
+            conn.close()
 
 def main():
     failed = 0
