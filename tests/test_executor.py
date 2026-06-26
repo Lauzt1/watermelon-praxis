@@ -2,9 +2,11 @@
 client that mimics the real adapter: it counts calls, returns canned responses, and
 auto-populates `journal` via the real `inverse_of` so rollback is end-to-end real.
 """
+from types import SimpleNamespace
+
 from praxis import memory
 from praxis.executor import Executor
-from praxis.models import Step
+from praxis.models import SkillContract, Step
 from praxis.platform.github import GitHubError, inverse_of
 
 
@@ -152,6 +154,90 @@ def test_set_milestone_targets_created_issue_without_explicit_arg(db):
     assert results[1].status == "done"
     patch_calls = [c for c in client.calls if c["op"] == "rest_patch"]
     assert patch_calls and patch_calls[0]["path"] == "/repos/o/r/issues/1"
+
+
+def _compute_contract(op):
+    return SkillContract(name=op, inputs={"issues": "list of issue dicts"},
+                         output="markdown table", primitives=[], test_args={"issues": []})
+
+
+def test_compute_op_synthesises_then_runs(db):
+    # a compute.* step with no registered skill -> synthesize once, then run the skill.
+    # the skill's `issues` kwarg is threaded from the preceding issues.list output.
+    client = FakeClient()
+    code = "def skill(client, issues):\n    return 'TABLE rows=' + str(len(issues))"
+
+    def fake_synth(step):
+        memory.put_skill(db, step.operation, _compute_contract(step.operation), code)
+        return SimpleNamespace(ok=True, operation=step.operation, attempts=[])
+
+    steps = [
+        Step(seq=1, intent="list", operation="issues.list", kind="api", args={}),
+        Step(seq=2, intent="group", operation="compute.group_by_label_and_render_table",
+             kind="compute", args={}),
+    ]
+    ex = Executor(db, client, synthesizer=fake_synth)
+    results = ex.run(run_id=1, steps=steps)
+    assert results[1].status == "done"
+    assert ex.synthesis_events and ex.synthesis_events[0]["operation"].startswith("compute.")
+    assert memory.get_skill(db, "compute.group_by_label_and_render_table") is not None
+
+
+def test_compute_op_reuses_registered_skill_without_synthesising(db):
+    client = FakeClient()
+    memory.put_skill(db, "compute.group_by_label_and_render_table",
+                     _compute_contract("compute.group_by_label_and_render_table"),
+                     "def skill(client, issues):\n    return len(issues)")
+
+    def boom(step):
+        raise AssertionError("must not synthesize when a skill is already registered")
+
+    steps = [
+        Step(seq=1, intent="list", operation="issues.list", kind="api", args={}),
+        Step(seq=2, intent="group", operation="compute.group_by_label_and_render_table",
+             kind="compute", args={}),
+    ]
+    ex = Executor(db, client, synthesizer=boom)
+    results = ex.run(run_id=1, steps=steps)
+    assert results[1].status == "done"
+    assert ex.synthesis_events == []
+
+
+def test_create_body_includes_latest_compute_result(db):
+    # the planner can't embed the runtime grouped table; the executor threads the latest
+    # compute output into the triage issue's body so the issue actually lists them.
+    client = FakeClient()
+    memory.put_skill(db, "compute.group_by_label_and_render_table",
+                     _compute_contract("compute.group_by_label_and_render_table"),
+                     "def skill(client, issues):\n    return '| label |\\n| bug |'")
+    steps = [
+        Step(seq=1, intent="list", operation="issues.list", kind="api", args={}),
+        Step(seq=2, intent="group", operation="compute.group_by_label_and_render_table",
+             kind="compute", args={}),
+        Step(seq=3, intent="summary", operation="issues.create", kind="api",
+             args={"title": "Triage summary", "body": "Open unassigned issues by label:"}),
+    ]
+    results = Executor(db, client).run(run_id=1, steps=steps)
+    assert all(r.status == "done" for r in results)
+    create = [c for c in client.calls if c["op"] == "rest_post" and c["path"].endswith("/issues")]
+    assert create and "| label |" in create[0]["body"]["body"], "triage body must carry the table"
+    assert "Open unassigned issues by label:" in create[0]["body"]["body"], "planner text kept"
+
+
+def test_compute_op_failed_synthesis_is_fatal(db):
+    client = FakeClient()
+
+    def failing_synth(step):
+        return SimpleNamespace(ok=False, operation=step.operation,
+                               attempts=["e1", "e2", "e3"])
+
+    steps = [
+        Step(seq=1, intent="group", operation="compute.broken", kind="compute", args={}),
+    ]
+    ex = Executor(db, client, synthesizer=failing_synth)
+    results = ex.run(run_id=1, steps=steps)
+    assert results[0].status == "failed"          # compute failure is not enrichment -> fatal
+    assert ex.synthesis_events and ex.synthesis_events[0]["ok"] is False
 
 
 def test_successful_run_records_steps_and_journal(db):

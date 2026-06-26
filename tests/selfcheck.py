@@ -120,6 +120,37 @@ def sandbox_rejects_forbidden_and_runs_clean():
 
 
 @check
+def synthesis_pure_effectful_and_failure_paths():
+    from praxis.models import Step
+    from praxis.synthesizer import synthesize
+    from tests.test_executor import FakeClient
+    from tests.test_synthesizer import (
+        EFFECTFUL_CODE, EFFECTFUL_CONTRACT, PURE_CODE, PURE_CONTRACT, StubLLM,
+    )
+    with tempfile.TemporaryDirectory() as d:
+        conn = connect(Path(d) / "s.db")
+        try:
+            # pure: in-memory test, skill registered
+            gap = Step(seq=1, intent="group", operation="compute.group_by_label_and_render_table",
+                       kind="compute", args={})
+            res = synthesize(gap, FakeClient(), conn, StubLLM([PURE_CONTRACT, PURE_CODE]))
+            assert res.ok and memory.get_skill(conn, gap.operation), "pure synthesis should register"
+            # effectful: tested against the client, self-cleaned via the journal
+            client = FakeClient()
+            gap2 = Step(seq=1, intent="ensure label", operation="labels.ensure", kind="api", args={})
+            res2 = synthesize(gap2, client, conn, StubLLM([EFFECTFUL_CONTRACT, EFFECTFUL_CODE]))
+            assert res2.ok and client.undo_applied, "effectful synthesis should self-clean"
+            # failure: 3 bad attempts, structured failure, nothing registered
+            gap3 = Step(seq=1, intent="broken", operation="compute.broken", kind="compute", args={})
+            bad = "def skill(client, issues):\n    import os\n    return os\n"
+            res3 = synthesize(gap3, FakeClient(), conn, StubLLM([PURE_CONTRACT, bad, bad, bad]))
+            assert not res3.ok and len(res3.attempts) == 3, "3-failure path should report cleanly"
+            assert memory.get_skill(conn, "compute.broken") is None, "no skill on failure"
+        finally:
+            conn.close()
+
+
+@check
 def reporter_renders():
     from praxis.reporter import build_report, render
     results = [StepResult(seq=1, operation="issues.create", status="done", latency_ms=5),

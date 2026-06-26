@@ -15,8 +15,13 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from . import memory, operations
+from . import memory, operations, sandbox
 from .models import Step, StepResult
+
+# A synthesised skill is in-process and pure-ish; if it overruns this it's a runaway, not
+# slow I/O (effectful skills make a handful of fast calls). The watchdog turns that into a
+# clean failure instead of a hang.
+SKILL_TIMEOUT_S = 20.0
 
 
 class ExecutorError(Exception):
@@ -29,11 +34,13 @@ class Executor:
         self.db = db
         self.client = client
         self.synthesizer = synthesizer
-        # Within-run references (e.g. the issue number a create produced). The planner
-        # can't know runtime ids, so enrichment steps resolve them from here. This is
-        # transient run state, distinct from the persistent ref_cache (label/milestone
-        # ids) wired in Phase 3.
+        # Within-run references (e.g. the issue number a create produced, or the issue list
+        # a compute step consumes). The planner can't know runtime values, so later steps
+        # resolve them from here. Transient run state, distinct from the persistent
+        # ref_cache (label/milestone ids) wired in Phase 3.
         self.run_refs: dict[str, Any] = {}
+        # Synthesis events recorded this run, surfaced by the reporter.
+        self.synthesis_events: list[dict[str, Any]] = []
 
     # --- dispatch ---------------------------------------------------------------
 
@@ -56,6 +63,7 @@ class Executor:
 
         if op == "issues.create":
             body = {k: args[k] for k in ("title", "body", "assignees", "labels", "milestone") if k in args}
+            body = self._thread_compute_result(body)
             resp = self.client.rest_post(f"/repos/{repo}/issues", json=body)
             if isinstance(resp, dict) and resp.get("number") is not None:
                 self.run_refs["last_issue"] = resp["number"]
@@ -68,24 +76,73 @@ class Executor:
             issue = self._issue_target(args)
             return self.client.rest_patch(f"/repos/{repo}/issues/{issue}", json={"milestone": args["milestone"]})
         if op == "issues.list":
-            return self.client.rest_get(f"/repos/{repo}/issues", params=args.get("filters") or args or None)
+            resp = self.client.rest_get(f"/repos/{repo}/issues", params=args.get("filters") or args or None)
+            self.run_refs["issues"] = resp        # thread the list to a downstream compute step
+            return resp
 
         if operations.is_compound(op):
-            return self._dispatch_skill(step)
+            result = self._dispatch_skill(step)
+            self.run_refs[op] = result            # e.g. run_refs["compute.group_by_label..."]
+            if operations.is_compute(op):
+                self.run_refs["result"] = result  # friendly alias for the latest transform output
+            return result
 
         raise ExecutorError(f"unknown operation {op!r}")
 
+    def _thread_compute_result(self, body: dict) -> dict:
+        """If a compute transform produced text this run, fold it into the issue body. The
+        planner can't embed a runtime-computed table, so the executor appends it (after any
+        prose the planner wrote) — this is what makes the triage issue actually list them."""
+        result = self.run_refs.get("result")
+        if not isinstance(result, str) or not result.strip():
+            return body
+        existing = body.get("body") or ""
+        if result in existing:
+            return body
+        body = dict(body)
+        body["body"] = (existing.rstrip() + "\n\n" + result).strip() if existing else result
+        return body
+
     def _dispatch_skill(self, step: Step) -> Any:
+        """Look up the skill; synthesise it on first use; then compile + run it sandboxed."""
         skill = memory.get_skill(self.db, step.operation)
         if skill is None:
             if self.synthesizer is None:
                 raise ExecutorError(
-                    f"no registered skill for {step.operation!r} and no synthesizer (Phase 2)"
+                    f"no registered skill for {step.operation!r} and no synthesizer"
                 )
-            self.synthesizer(step)  # Phase 2 wires this to reason->build->test->register
+            result = self.synthesizer(step)       # reason -> build -> test -> register
+            self.synthesis_events.append({
+                "operation": step.operation,
+                "ok": bool(getattr(result, "ok", False)),
+                "attempts": len(getattr(result, "attempts", []) or []),
+            })
+            if not getattr(result, "ok", False):
+                raise ExecutorError(
+                    f"synthesis failed for {step.operation!r} after "
+                    f"{len(getattr(result, 'attempts', []) or [])} attempts"
+                )
             skill = memory.get_skill(self.db, step.operation)
-        # Phase 2 compiles + runs the registered skill code; the spine doesn't need it yet.
-        raise ExecutorError(f"skill execution for {step.operation!r} arrives in Phase 2")
+            if skill is None:
+                raise ExecutorError(f"skill {step.operation!r} not registered after synthesis")
+
+        fn = sandbox.compile_skill(skill["code"])
+        kwargs = self._skill_kwargs(step, skill["contract"])
+        return sandbox.run_skill(fn, client=self.client, kwargs=kwargs, timeout_s=SKILL_TIMEOUT_S)
+
+    def _skill_kwargs(self, step: Step, contract: dict | None) -> dict[str, Any]:
+        """Build the skill's kwargs: planner-supplied literals first, then fill any declared
+        input from this run's references (e.g. the `issues` a compute transform consumes)."""
+        inputs = (contract or {}).get("inputs", {}) if isinstance(contract, dict) else {}
+        kwargs: dict[str, Any] = dict(step.args or {})
+        for name in inputs:
+            if name in kwargs:
+                continue
+            if name in self.run_refs:
+                kwargs[name] = self.run_refs[name]
+            elif name in ("issues", "items", "rows", "data", "results") and "issues" in self.run_refs:
+                kwargs[name] = self.run_refs["issues"]
+        return kwargs
 
     # --- run loop ---------------------------------------------------------------
 
@@ -93,7 +150,8 @@ class Executor:
         results: list[StepResult] = []
         completed_mutations: list[StepResult] = []  # done mutations, flipped on rollback
         fatal = False
-        self.run_refs = {}  # fresh within-run reference scope
+        self.run_refs = {}          # fresh within-run reference scope
+        self.synthesis_events = []   # fresh per-run synthesis log
 
         for step in steps:
             if fatal:

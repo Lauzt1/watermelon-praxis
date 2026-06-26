@@ -29,13 +29,16 @@ class Orchestrator:
         had_cached_plan = memory.get_plan(self.db, key) is not None
         plan = planner.plan(instruction, signature, self.db, self.llm)
 
-        results = Executor(self.db, self.client, self.synthesizer).run(run_id, plan.steps)
+        executor = Executor(self.db, self.client, self.synthesizer)
+        results = executor.run(run_id, plan.steps)
 
         wall_ms = int((time.perf_counter() - t0) * 1000)
+        synthesized = [e["operation"] for e in executor.synthesis_events if e["ok"]]
         memory_delta = {
             "run_id": run_id,
             "plan_reused": had_cached_plan,
             "plan_stored": not had_cached_plan,
+            "skills_synthesized": synthesized,
         }
         report = build_report(
             instruction, results,
@@ -43,6 +46,7 @@ class Orchestrator:
             llm_calls=self.llm.llm_calls,
             wall_ms=wall_ms,
             memory_delta=memory_delta,
+            synthesis_events=executor.synthesis_events,
         )
 
         memory.finish_run(self.db, run_id, report.status, report.metrics["api_calls"],
