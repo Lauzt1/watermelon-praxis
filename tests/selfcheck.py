@@ -98,6 +98,28 @@ def executor_fatal_rolls_back():
             conn.close()
 
 @check
+def sandbox_rejects_forbidden_and_runs_clean():
+    from praxis.sandbox import compile_skill, run_skill
+    forbidden = [
+        "def skill(client):\n    import os\n    return 1",
+        "def skill(client):\n    from os import path\n    return 1",
+        "def skill(client):\n    return open('x').read()",
+        "def skill(client):\n    return eval('1+1')",
+        "def skill(client):\n    return __import__('os')",
+        "def skill(client):\n    return ().__class__.__bases__",
+    ]
+    for src in forbidden:
+        try:
+            compile_skill(src)
+        except ValueError:
+            continue
+        raise AssertionError(f"sandbox accepted forbidden code:\n{src}")
+    fn = compile_skill("def skill(client, items):\n    return sorted(items)")
+    assert run_skill(fn, client=None, kwargs={"items": [3, 1, 2]}, timeout_s=2) == [1, 2, 3], \
+        "clean skill did not run"
+
+
+@check
 def reporter_renders():
     from praxis.reporter import build_report, render
     results = [StepResult(seq=1, operation="issues.create", status="done", latency_ms=5),
