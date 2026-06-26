@@ -63,6 +63,40 @@ def memory_roundtrips():
         finally:
             conn.close()
 
+@check
+def executor_enrichment_keeps_primary():
+    from praxis.executor import Executor
+    from tests.test_executor import FakeClient
+    with tempfile.TemporaryDirectory() as d:
+        conn = connect(Path(d) / "e.db")
+        try:
+            client = FakeClient(fail_on_seq=2)
+            steps = [Step(seq=1, intent="c", operation="issues.create", kind="api", args={"title": "A"}),
+                     Step(seq=2, intent="l", operation="issues.add_label", kind="api", args={"issue": 1, "label": "bug"})]
+            results = Executor(conn, client).run(run_id=1, steps=steps)
+            assert results[0].status == "done", "primary should be kept"
+            assert results[1].status == "failed", "enrichment failure should be reported"
+            assert not client.undo_applied, "no rollback on an enrichment failure"
+        finally:
+            conn.close()
+
+@check
+def executor_fatal_rolls_back():
+    from praxis.executor import Executor
+    from tests.test_executor import FakeClient
+    with tempfile.TemporaryDirectory() as d:
+        conn = connect(Path(d) / "f.db")
+        try:
+            client = FakeClient(fail_on_seq=2)
+            steps = [Step(seq=1, intent="a", operation="issues.create", kind="api", args={"title": "A"}),
+                     Step(seq=2, intent="b", operation="issues.create", kind="api", args={"title": "B"})]
+            results = Executor(conn, client).run(run_id=1, steps=steps)
+            assert results[0].status == "rolled_back", "prior mutation should roll back"
+            assert results[1].status == "failed"
+            assert client.undo_applied, "inverse op should be replayed on a fatal failure"
+        finally:
+            conn.close()
+
 def main():
     failed = 0
     for fn in CHECKS:
