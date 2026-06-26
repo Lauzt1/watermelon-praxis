@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import memory
+from . import memory, seeding
 from .config import Config, load
 from .db import connect
 from .llm import LLM
@@ -29,6 +29,44 @@ def cmd_run(args: argparse.Namespace, config: Config) -> None:
     try:
         report = Orchestrator(conn, client, llm, synthesizer=synthesizer).run(args.instruction)
         print(report.model_dump_json(indent=2) if args.json else render(report))
+    finally:
+        client.close()
+        conn.close()
+
+
+def cmd_seed(args: argparse.Namespace, config: Config) -> None:
+    client = GitHub(config.github_token, config.github_repo)
+    try:
+        result = seeding.seed_repo(client)
+        created, skipped = result["created"], result["skipped"]
+        print(f"seed: {len(created)} created, {len(skipped)} already present "
+              f"(repo {config.github_repo})")
+        for c in created:
+            print(f"  + #{c['number']} {c['title']}  labels={c['labels']}")
+        for title in skipped:
+            print(f"  = (exists) {title}")
+    finally:
+        client.close()
+
+
+def cmd_prewarm(args: argparse.Namespace, config: Config) -> None:
+    conn = connect(config.db_path)
+    client = GitHub(config.github_token, config.github_repo)
+    llm = LLM(config)
+    synthesizer = lambda step, refs=None: synthesize(step, client, conn, llm, run_refs=refs)  # noqa: E731
+
+    def run_one(instruction: str):
+        return Orchestrator(conn, client, llm, synthesizer=synthesizer).run(instruction)
+
+    try:
+        summary = seeding.prewarm(run_one, args.times)
+        print(f"prewarm: ran {len(summary)} executions "
+              f"({args.times}x {len(seeding.DEMO_INSTRUCTIONS)} instructions)")
+        for s in summary:
+            m = s["metrics"]
+            print(f"  round {s['round']} instr {s['instruction_index']}: "
+                  f"{s['status']} api={m.get('api_calls')} llm={m.get('llm_calls')} "
+                  f"wall_ms={m.get('wall_ms')} fail={m.get('failure_count')}")
     finally:
         client.close()
         conn.close()
@@ -135,6 +173,11 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser("doctor", help="check keys, DB/schema, and GitHub access")
 
+    sub.add_parser("seed", help="idempotently reset the sandbox repo to the known demo issues")
+
+    p_pre = sub.add_parser("prewarm", help="run the demo instructions N times to populate memory")
+    p_pre.add_argument("--times", type=int, default=1, help="how many rounds to run (default 1)")
+
     p_mem = sub.add_parser("memory", help="inspect learned rules, ref-cache, op-stats, skills")
     p_mem.add_argument("--operation", help="filter rules/op-stats/skills to one operation")
 
@@ -143,6 +186,10 @@ def main(argv: list[str] | None = None) -> None:
         cmd_run(args, config)
     elif args.command == "doctor":
         cmd_doctor(args, config)
+    elif args.command == "seed":
+        cmd_seed(args, config)
+    elif args.command == "prewarm":
+        cmd_prewarm(args, config)
     elif args.command == "memory":
         cmd_memory(args, config)
 
