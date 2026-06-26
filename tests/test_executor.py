@@ -99,6 +99,61 @@ def test_steps_after_fatal_are_skipped(db):
     assert results[1].status == "skipped"       # never ran after the fatal stop
 
 
+def test_add_label_targets_created_issue_without_explicit_arg(db):
+    # the planner can't know the runtime issue number; the executor threads it from the
+    # preceding create so enrichment steps reach the right issue.
+    client = FakeClient()
+    steps = [
+        Step(seq=1, intent="create", operation="issues.create", kind="api", args={"title": "A"}),
+        Step(seq=2, intent="label", operation="issues.add_label", kind="api", args={"label": "bug"}),
+    ]
+    results = Executor(db, client).run(run_id=1, steps=steps)
+    assert results[0].status == "done"
+    assert results[1].status == "done"
+    label_calls = [c for c in client.calls if c["op"] == "rest_post" and c["path"].endswith("/labels")]
+    assert label_calls and label_calls[0]["path"] == "/repos/o/r/issues/1/labels"
+
+
+def test_add_label_ignores_placeholder_issue_ref(db):
+    # planners sometimes emit a placeholder like {"issue": "ctx:from_step1"}; that must
+    # not become the URL path — resolve the real created issue from run context instead.
+    client = FakeClient()
+    steps = [
+        Step(seq=1, intent="create", operation="issues.create", kind="api", args={"title": "A"}),
+        Step(seq=2, intent="label", operation="issues.add_label", kind="api",
+             args={"issue": "ctx:from_step1", "label": "bug"}),
+    ]
+    results = Executor(db, client).run(run_id=1, steps=steps)
+    assert results[1].status == "done"
+    label_calls = [c for c in client.calls if c["path"].endswith("/labels")]
+    assert label_calls[0]["path"] == "/repos/o/r/issues/1/labels"
+
+
+def test_add_label_honors_explicit_numeric_issue(db):
+    client = FakeClient()
+    steps = [
+        Step(seq=1, intent="create", operation="issues.create", kind="api", args={"title": "A"}),
+        Step(seq=2, intent="label", operation="issues.add_label", kind="api",
+             args={"issue_number": "1", "label": "bug"}),  # digit string + alt key
+    ]
+    results = Executor(db, client).run(run_id=1, steps=steps)
+    assert results[1].status == "done"
+    label_calls = [c for c in client.calls if c["path"].endswith("/labels")]
+    assert label_calls[0]["path"] == "/repos/o/r/issues/1/labels"
+
+
+def test_set_milestone_targets_created_issue_without_explicit_arg(db):
+    client = FakeClient()
+    steps = [
+        Step(seq=1, intent="create", operation="issues.create", kind="api", args={"title": "A"}),
+        Step(seq=2, intent="milestone", operation="issues.set_milestone", kind="api", args={"milestone": 3}),
+    ]
+    results = Executor(db, client).run(run_id=1, steps=steps)
+    assert results[1].status == "done"
+    patch_calls = [c for c in client.calls if c["op"] == "rest_patch"]
+    assert patch_calls and patch_calls[0]["path"] == "/repos/o/r/issues/1"
+
+
 def test_successful_run_records_steps_and_journal(db):
     client = FakeClient()
     steps = [Step(seq=1, intent="create", operation="issues.create", kind="api", args={"title": "A"})]

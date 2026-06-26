@@ -52,14 +52,20 @@ def is_enrichment(op: str) -> bool:
     return op in ENRICHMENT_OPS
 
 
-# Allowed-vocabulary string for the planner prompt (compute.* is open-ended).
+# Planner-facing vocabulary. NOTE: the *.ensure ops are deliberately NOT offered to the
+# planner. They are executor-internal, injected only via a learned precondition rule
+# (Phase 3) or synthesis. Keeping them out of the plan is what preserves the learning
+# headline: run 1 must emit the BARE issues.add_label so it hits the 422 and learns the
+# rule — if the planner pre-empted that with labels.ensure, there'd be nothing to learn.
 VOCABULARY_HELP = (
-    "Allowed operations:\n"
-    "  issues.create       — create an issue (kind: api)\n"
-    "  issues.add_label    — add an existing label to an issue (kind: api)\n"
-    "  issues.set_milestone— set an issue's milestone (kind: api)\n"
-    "  issues.list         — list/search issues (kind: api)\n"
-    "  labels.ensure       — resolve/create a label, caching its id (kind: api)\n"
-    "  milestones.ensure   — resolve/create a milestone, caching it (kind: api)\n"
-    "  compute.<name>      — a synthesised in-process transform (kind: compute)\n"
+    "Allowed operations (use ONLY these, nothing else):\n"
+    "  issues.create        - create an issue (kind: api)\n"
+    "  issues.add_label     - add a label to an issue (kind: api)\n"
+    "  issues.set_milestone - set an issue's milestone (kind: api)\n"
+    "  issues.list          - list/search issues (kind: api)\n"
+    "  compute.<name>       - a synthesised in-process transform, e.g.\n"
+    "                         compute.group_by_label_and_render_table (kind: compute)\n"
+    "\nDo NOT emit labels.ensure, milestones.ensure, or any operation not listed above. "
+    "Add labels and milestones DIRECTLY with issues.add_label / issues.set_milestone; "
+    "the agent ensures prerequisites (creating a missing label/milestone) automatically."
 )

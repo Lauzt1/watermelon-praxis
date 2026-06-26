@@ -29,21 +29,43 @@ class Executor:
         self.db = db
         self.client = client
         self.synthesizer = synthesizer
+        # Within-run references (e.g. the issue number a create produced). The planner
+        # can't know runtime ids, so enrichment steps resolve them from here. This is
+        # transient run state, distinct from the persistent ref_cache (label/milestone
+        # ids) wired in Phase 3.
+        self.run_refs: dict[str, Any] = {}
 
     # --- dispatch ---------------------------------------------------------------
+
+    def _issue_target(self, args: dict) -> Any:
+        # Accept only an integer-like explicit issue; anything else (a missing key, or a
+        # planner placeholder such as "ctx:issue_number_from_step1") resolves from the
+        # within-run context populated by the preceding create.
+        raw = args.get("issue", args.get("issue_number"))
+        if isinstance(raw, int):
+            return raw
+        if isinstance(raw, str) and raw.isdigit():
+            return int(raw)
+        issue = self.run_refs.get("last_issue")
+        if issue is None:
+            raise ExecutorError("no target issue (none usable in args and none created this run)")
+        return issue
 
     def _dispatch(self, step: Step) -> Any:
         op, args, repo = step.operation, step.args, self.client.repo
 
         if op == "issues.create":
             body = {k: args[k] for k in ("title", "body", "assignees", "labels", "milestone") if k in args}
-            return self.client.rest_post(f"/repos/{repo}/issues", json=body)
+            resp = self.client.rest_post(f"/repos/{repo}/issues", json=body)
+            if isinstance(resp, dict) and resp.get("number") is not None:
+                self.run_refs["last_issue"] = resp["number"]
+            return resp
         if op == "issues.add_label":
-            issue = args["issue"]
+            issue = self._issue_target(args)
             labels = args.get("labels") or [args["label"]]
             return self.client.rest_post(f"/repos/{repo}/issues/{issue}/labels", json={"labels": labels})
         if op == "issues.set_milestone":
-            issue = args["issue"]
+            issue = self._issue_target(args)
             return self.client.rest_patch(f"/repos/{repo}/issues/{issue}", json={"milestone": args["milestone"]})
         if op == "issues.list":
             return self.client.rest_get(f"/repos/{repo}/issues", params=args.get("filters") or args or None)
@@ -71,6 +93,7 @@ class Executor:
         results: list[StepResult] = []
         completed_mutations: list[StepResult] = []  # done mutations, flipped on rollback
         fatal = False
+        self.run_refs = {}  # fresh within-run reference scope
 
         for step in steps:
             if fatal:

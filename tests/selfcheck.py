@@ -97,6 +97,17 @@ def executor_fatal_rolls_back():
         finally:
             conn.close()
 
+@check
+def reporter_renders():
+    from praxis.reporter import build_report, render
+    results = [StepResult(seq=1, operation="issues.create", status="done", latency_ms=5),
+               StepResult(seq=2, operation="issues.add_label", status="failed", error="422")]
+    rep = build_report("demo", results, api_calls=2, llm_calls=1, wall_ms=10,
+                       memory_delta={"run_id": 1})
+    text = render(rep)
+    assert "issues.create" in text and "Metrics" in text, "render missing content"
+    assert rep.status == "partial", "synthetic enrichment failure should be partial"
+
 def main():
     failed = 0
     for fn in CHECKS:
