@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import memory, seeding
+from pathlib import Path
+
+from . import memory, metrics, recall, seeding
 from .config import Config, load
 from .db import connect
 from .llm import LLM
@@ -121,6 +123,38 @@ def cmd_memory(args: argparse.Namespace, config: Config) -> None:
         conn.close()
 
 
+def _signature_for(conn, instruction: str, config: Config) -> dict:
+    """Resolve the instruction's signature. For an already-run instruction this is served from
+    the exact-hash cache (no LLM/key needed); otherwise it costs one canonicalisation call."""
+    return recall.signature_for(conn, instruction, LLM(config))
+
+
+def cmd_stats(args: argparse.Namespace, config: Config) -> None:
+    conn = connect(config.db_path)
+    try:
+        signature = _signature_for(conn, args.instruction, config)
+        rows = metrics.runs_for_signature(conn, signature)
+        print(metrics.render_stats(args.instruction, rows))
+    finally:
+        conn.close()
+
+
+def cmd_curve(args: argparse.Namespace, config: Config) -> None:
+    conn = connect(config.db_path)
+    try:
+        signature = _signature_for(conn, args.instruction, config)
+        rows = metrics.runs_for_signature(conn, signature)
+        if not rows:
+            print(f"No runs recorded for: {args.instruction}")
+            return
+        out_dir = Path(config.db_path).parent
+        paths = metrics.write_curve(rows, signature, out_dir=out_dir)
+        print(f"curve: {len(rows)} run(s) -> {paths['csv']}")
+        print(f"       {paths['svg']}")
+    finally:
+        conn.close()
+
+
 def cmd_doctor(args: argparse.Namespace, config: Config) -> None:
     ok = True
 
@@ -184,6 +218,12 @@ def main(argv: list[str] | None = None) -> None:
     p_mem = sub.add_parser("memory", help="inspect learned rules, ref-cache, op-stats, skills")
     p_mem.add_argument("--operation", help="filter rules/op-stats/skills to one operation")
 
+    p_stats = sub.add_parser("stats", help="run-1-vs-N metrics table for an instruction")
+    p_stats.add_argument("instruction", help="the instruction (matched by signature)")
+
+    p_curve = sub.add_parser("curve", help="export a learning-curve CSV + SVG for an instruction")
+    p_curve.add_argument("instruction", help="the instruction (matched by signature)")
+
     args = parser.parse_args(argv)
     if args.command == "run":
         cmd_run(args, config)
@@ -195,6 +235,10 @@ def main(argv: list[str] | None = None) -> None:
         cmd_prewarm(args, config)
     elif args.command == "memory":
         cmd_memory(args, config)
+    elif args.command == "stats":
+        cmd_stats(args, config)
+    elif args.command == "curve":
+        cmd_curve(args, config)
 
 
 if __name__ == "__main__":
