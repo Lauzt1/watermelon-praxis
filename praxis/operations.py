@@ -74,5 +74,7 @@ VOCABULARY_HELP = (
     "  - Emit exactly ONE label per issues.add_label step (one label = one step), with the "
     'label name in args as {"label": "<name>"}.\n'
     "  - Use canonical label names: a high-priority issue gets the label `priority:high`; an "
-    "urgent one `priority:urgent`; a plain bug gets `bug`."
+    "urgent one `priority:urgent`; a plain bug gets `bug`.\n"
+    '  - Set a milestone by its TITLE in args as {"milestone": "<title>"} (NOT a number); the '
+    "agent resolves the title to a milestone number, creating the milestone if it does not exist."
 )

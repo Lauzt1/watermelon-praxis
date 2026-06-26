@@ -185,6 +185,40 @@ def executor_learns_then_preapplies_precondition():
 
 
 @check
+def executor_learns_then_preapplies_milestone_precondition():
+    # the LIVE Phase 3 headline's exact shape (the REAL GitHub constraint: a milestone must be
+    # set by number, not title), against ONE persistent repo across two runs:
+    #   run 1: set_milestone by title 422s -> learn the rule, synthesise+run milestones.ensure
+    #          (creates the milestone, caches its number), retry with the number, succeed.
+    #   run 2: the rule is pre-applied and the number served from ref_cache -> zero new 422s.
+    from praxis.executor import Executor
+    from tests.test_executor import MilestoneAwareClient, ensure_milestone_synth
+    with tempfile.TemporaryDirectory() as d:
+        conn = connect(Path(d) / "m2.db")
+        try:
+            steps = [Step(seq=1, intent="c", operation="issues.create", kind="api", args={"title": "A"}),
+                     Step(seq=2, intent="m", operation="issues.set_milestone", kind="api", args={"milestone": "Sprint 1"})]
+            client = MilestoneAwareClient(existing_titles=())
+            synth = ensure_milestone_synth(conn)
+            r1 = Executor(conn, client, synthesizer=synth).run(run_id=1, steps=steps)
+            rules = memory.rules_for(conn, "issues.set_milestone")
+            assert any(rr["rule_type"] == "precondition" and rr["learned_in_run"] == 1 for rr in rules), \
+                "run 1 must learn the issues.set_milestone precondition rule"
+            assert any(s.operation == "issues.set_milestone" and s.status == "done" for s in r1), \
+                "set_milestone must succeed on the retry with the resolved number"
+            assert memory.get_ref(conn, "milestone:Sprint 1") is not None, "the number must be cached"
+
+            client.milestone_422_count = 0                       # measure run 2 in isolation
+            r2 = Executor(conn, client, synthesizer=synth).run(run_id=2, steps=steps)
+            assert client.milestone_422_count == 0, "run 2 pre-applies + cached number -> zero new 422s"
+            assert not any(s.status == "failed" for s in r2), "run 2 takes no failure"
+            ops = [s.operation for s in r2]
+            assert ops.index("milestones.ensure") < ops.index("issues.set_milestone"), "ensure injected first"
+        finally:
+            conn.close()
+
+
+@check
 def identical_rerun_reuses_signature_and_plan_with_zero_llm():
     # the headline's plumbing: a second identical run reuses the exact-hash signature AND the
     # cached plan, so it makes ZERO LLM calls (deterministic reuse, Task 3.2).

@@ -95,6 +95,143 @@ class LabelAwareClient:
         return self._journaled("rest_delete", path, json or {}, {})
 
 
+# The synthesised milestones.ensure skill: resolve-or-create a milestone by title via
+# primitives, returning the milestone dict (with its number). The live GitHub constraint the
+# whole headline rests on — you cannot set a milestone by title, only by an existing number.
+ENSURE_MILESTONE_CODE = (
+    "def skill(client, milestone):\n"
+    "    existing = client.rest_get('/repos/' + client.repo + '/milestones')\n"
+    "    for ms in existing:\n"
+    "        if ms['title'] == milestone:\n"
+    "            return ms\n"
+    "    return client.rest_post('/repos/' + client.repo + '/milestones', json={'title': milestone})\n"
+)
+
+
+def ensure_milestone_synth(db):
+    contract = SkillContract(name="milestones.ensure",
+                             inputs={"milestone": "the milestone title to resolve or create"},
+                             output="the milestone dict (with its number)",
+                             primitives=["rest_get", "rest_post"],
+                             test_args={"milestone": "praxis-synth-test"})
+
+    def synth(step, refs=None):
+        memory.put_skill(db, step.operation, contract, ENSURE_MILESTONE_CODE)
+        return SimpleNamespace(ok=True, operation=step.operation, attempts=[])
+
+    return synth
+
+
+class MilestoneAwareClient:
+    """Models the REAL GitHub milestone constraint: PATCHing an issue's milestone with a title
+    or a nonexistent number 422s; only an existing milestone NUMBER is accepted. Creating a
+    milestone (POST) returns its assigned number."""
+
+    def __init__(self, existing_titles=(), repo="o/r"):
+        self.repo = repo
+        self.api_calls = 0
+        self.journal = None
+        self.calls = []
+        self.milestones = {}          # title -> number
+        self.milestone_422_count = 0
+        self._issue_no = 0
+        self._next_ms = 0
+        for t in existing_titles:
+            self._next_ms += 1
+            self.milestones[t] = self._next_ms
+
+    def _journaled(self, op, path, body, resp):
+        if self.journal is not None:
+            inv = inverse_of(op, path, body, resp)
+            if inv is not None:
+                self.journal.append(inv)
+        return resp
+
+    def rest_get(self, path, params=None):
+        self.api_calls += 1
+        self.calls.append({"op": "rest_get", "path": path, "body": None})
+        if path.endswith("/milestones"):
+            return [{"number": n, "title": t}
+                    for t, n in sorted(self.milestones.items(), key=lambda kv: kv[1])]
+        return []
+
+    def rest_post(self, path, json=None):
+        body = json or {}
+        self.api_calls += 1
+        self.calls.append({"op": "rest_post", "path": path, "body": body})
+        if path.endswith("/issues"):
+            self._issue_no += 1
+            return self._journaled("rest_post", path, body, {"number": self._issue_no})
+        if path.endswith("/milestones"):
+            self._next_ms += 1
+            self.milestones[body["title"]] = self._next_ms
+            return self._journaled("rest_post", path, body,
+                                   {"number": self._next_ms, "title": body["title"]})
+        return self._journaled("rest_post", path, body, {})
+
+    def rest_patch(self, path, json=None):
+        body = json or {}
+        self.api_calls += 1
+        self.calls.append({"op": "rest_patch", "path": path, "body": body})
+        ms = body.get("milestone", "__absent__")
+        if ms not in ("__absent__", None) and not (isinstance(ms, int) and ms in self.milestones.values()):
+            self.milestone_422_count += 1
+            raise GitHubError(422, f"invalid milestone {ms}", "rest_patch", path)
+        return self._journaled("rest_patch", path, body, {})
+
+    def rest_delete(self, path, json=None):
+        self.api_calls += 1
+        self.calls.append({"op": "rest_delete", "path": path, "body": json or {}})
+        return self._journaled("rest_delete", path, json or {}, {})
+
+
+def test_set_milestone_422_learns_rule_and_retries_via_ensure(db):
+    # run 1: set_milestone by title 422s -> learn the precondition, synthesise+run
+    # milestones.ensure (creates the milestone, caches its number), retry with the NUMBER.
+    client = MilestoneAwareClient(existing_titles=())             # "Sprint 1" is missing
+    ex = Executor(db, client, synthesizer=ensure_milestone_synth(db))
+    steps = [
+        Step(seq=1, intent="create", operation="issues.create", kind="api", args={"title": "Login bug"}),
+        Step(seq=2, intent="milestone", operation="issues.set_milestone", kind="api", args={"milestone": "Sprint 1"}),
+    ]
+    results = ex.run(run_id=1, steps=steps)
+
+    rules = memory.rules_for(db, "issues.set_milestone")
+    assert any(r["rule_type"] == "precondition" and r["detail"]["action"] == "milestones.ensure"
+               and r["detail"]["param"] == "milestone" and r["learned_in_run"] == 1
+               for r in rules), "the issues.set_milestone precondition rule must be learned in run 1"
+    assert "Sprint 1" in client.milestones, "milestones.ensure must have created the missing milestone"
+    assert memory.get_ref(db, "milestone:Sprint 1") is not None, "the resolved number must be cached"
+    assert any(r.operation == "milestones.ensure" and r.status == "done" for r in results)
+    sm = [r for r in results if r.operation == "issues.set_milestone"]
+    assert any(r.status == "done" for r in sm), "set_milestone must succeed on the retry"
+    # the successful PATCH used the resolved NUMBER, not the title
+    patches = [c for c in client.calls if c["op"] == "rest_patch" and isinstance(c["body"].get("milestone"), int)]
+    assert patches and patches[-1]["body"]["milestone"] == client.milestones["Sprint 1"]
+
+
+def test_known_milestone_precondition_preapplies_and_resolves_number(db):
+    # run 2: the rule is known and the number cached -> milestones.ensure is pre-applied
+    # (ref-cache hit, no API), and set_milestone uses the cached NUMBER -> zero 422s.
+    memory.add_rule(db, "issues.set_milestone", "precondition",
+                    {"action": "milestones.ensure", "param": "milestone"}, learned_in_run=1)
+    memory.put_ref(db, "milestone:Sprint 1", "milestone", "1", run_id=1)
+    client = MilestoneAwareClient(existing_titles=("Sprint 1",))  # number 1 persists in the repo
+    ex = Executor(db, client, synthesizer=ensure_milestone_synth(db))
+    steps = [
+        Step(seq=1, intent="create", operation="issues.create", kind="api", args={"title": "X"}),
+        Step(seq=2, intent="milestone", operation="issues.set_milestone", kind="api", args={"milestone": "Sprint 1"}),
+    ]
+    results = ex.run(run_id=2, steps=steps)
+
+    assert client.milestone_422_count == 0, "pre-applied rule + cached number -> zero 422s"
+    assert not any(r.status == "failed" for r in results)
+    patches = [c for c in client.calls if c["op"] == "rest_patch" and "milestone" in c["body"]]
+    assert patches and patches[0]["body"]["milestone"] == 1, "set_milestone must use the resolved number"
+    resolve_calls = [c for c in client.calls if c["path"].endswith("/milestones")]
+    assert resolve_calls == [], "a ref-cache hit must skip the milestone resolve entirely"
+
+
 def test_add_label_422_learns_precondition_rule_and_retries_via_ensure(db):
     # run 1: a bare add_label on a missing label 422s -> the executor extracts the
     # precondition rule, persists it (learned_in_run=1), injects + synthesises labels.ensure,

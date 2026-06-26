@@ -61,6 +61,20 @@ class Executor:
             raise ExecutorError("no target issue (none usable in args and none created this run)")
         return issue
 
+    def _resolve_milestone(self, value):
+        """GitHub accepts only a milestone NUMBER, never a title. Resolve a title to its cached
+        number (populated by milestones.ensure); an already-numeric value passes through; an
+        unresolved title passes through unchanged so it 422s and triggers the precondition
+        learning (which then runs milestones.ensure, caches the number, and the retry resolves)."""
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        cached = memory.get_ref(self.db, f"milestone:{value}")
+        if cached is not None and str(cached).isdigit():
+            return int(cached)
+        return value
+
     def _dispatch(self, step: Step) -> Any:
         op, args, repo = step.operation, step.args, self.client.repo
 
@@ -77,7 +91,8 @@ class Executor:
             return self.client.rest_post(f"/repos/{repo}/issues/{issue}/labels", json={"labels": labels})
         if op == "issues.set_milestone":
             issue = self._issue_target(args)
-            return self.client.rest_patch(f"/repos/{repo}/issues/{issue}", json={"milestone": args["milestone"]})
+            milestone = self._resolve_milestone(args.get("milestone"))
+            return self.client.rest_patch(f"/repos/{repo}/issues/{issue}", json={"milestone": milestone})
         if op == "issues.list":
             resp = self.client.rest_get(f"/repos/{repo}/issues", params=args.get("filters") or args or None)
             self.run_refs["issues"] = resp        # thread the list to a downstream compute step
