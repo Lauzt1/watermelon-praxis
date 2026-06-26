@@ -27,7 +27,8 @@ def cmd_run(args: argparse.Namespace, config: Config) -> None:
     # synthesize(gap, client, db, llm, run_refs); the closure binds the live client/db/llm.
     synthesizer = lambda step, refs=None: synthesize(step, client, conn, llm, run_refs=refs)  # noqa: E731
     try:
-        report = Orchestrator(conn, client, llm, synthesizer=synthesizer).run(args.instruction)
+        report = Orchestrator(conn, client, llm, synthesizer=synthesizer).run(
+            args.instruction, learning_enabled=not args.no_learning)
         print(report.model_dump_json(indent=2) if args.json else render(report))
     finally:
         client.close()
@@ -170,6 +171,8 @@ def main(argv: list[str] | None = None) -> None:
     p_run = sub.add_parser("run", help="run a natural-language instruction")
     p_run.add_argument("instruction", help="the instruction in quotes")
     p_run.add_argument("--json", action="store_true", help="emit the report as JSON")
+    p_run.add_argument("--no-learning", action="store_true",
+                       help="disable rule pre-loading + learn-and-retry (the cold baseline)")
 
     sub.add_parser("doctor", help="check keys, DB/schema, and GitHub access")
 

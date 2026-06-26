@@ -31,10 +31,14 @@ class ExecutorError(Exception):
 
 
 class Executor:
-    def __init__(self, db, client, synthesizer=None):
+    def __init__(self, db, client, synthesizer=None, learning_enabled=True):
         self.db = db
         self.client = client
         self.synthesizer = synthesizer
+        # When False (the `run --no-learning` cold baseline): no learned-rule pre-loading and
+        # no 422 learn-and-retry recovery — the agent runs with zero memory so the on-camera
+        # cold-vs-warm comparison is honest.
+        self.learning_enabled = learning_enabled
         # Within-run references (e.g. the issue number a create produced, or the issue list
         # a compute step consumes). The planner can't know runtime values, so later steps
         # resolve them from here. Transient run state, distinct from the persistent
@@ -378,6 +382,8 @@ class Executor:
         rules — this is the cross-run/cross-instruction transfer: a rule learned the hard way
         once is pre-applied for free on every later run that touches the same operation."""
         out: list[Step] = []
+        if not self.learning_enabled:            # cold baseline: no rule pre-loading
+            return out
         for rule in memory.rules_for(self.db, step.operation):
             if rule["rule_type"] != "precondition":
                 continue
@@ -414,6 +420,8 @@ class Executor:
         enrichment op), learn the precondition rule, inject + run the prerequisite (synthesised
         on first use), and retry the step once. Returns True iff fully handled here (the retry
         succeeded, or the recovery turned fatal); False to fall through to the §9 class policy."""
+        if not self.learning_enabled:            # cold baseline: no learn-and-retry recovery
+            return False
         rule = self._extract_constraint_rule(step.operation, error)
         if rule is None:
             return False

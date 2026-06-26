@@ -754,6 +754,42 @@ def test_set_milestone_fan_out_warm_preapplies_and_takes_zero_422(db):
     assert resolve_calls == [], "a ref-cache hit must skip the milestone resolve entirely"
 
 
+def test_no_learning_disables_recovery_and_learning(db):
+    # the cold baseline: with learning off, a set_milestone-by-title 422 is NOT recovered and NO
+    # rule is learned -> the enrichment fails (non-fatal), the milestone is never created.
+    client = TriageClient()                       # Sprint 1 does not exist, nothing cached
+    ex = Executor(db, client, synthesizer=ensure_milestone_synth(db), learning_enabled=False)
+    steps = [
+        Step(seq=1, intent="list", operation="issues.list", kind="api", args={"filters": {"state": "open"}}),
+        Step(seq=2, intent="milestone", operation="issues.set_milestone", kind="api",
+             args={"milestone": "Sprint 1", "target": "all", "skip_if_label": "needs-triage"}),
+    ]
+    results = ex.run(run_id=1, steps=steps)
+    assert memory.rules_for(db, "issues.set_milestone") == [], "no rule learned with learning off"
+    sm = [r for r in results if r.operation == "issues.set_milestone"]
+    assert sm and all(r.status == "failed" for r in sm), "the 422 is not recovered"
+    assert "Sprint 1" not in client.milestones, "milestones.ensure never ran"
+
+
+def test_no_learning_skips_preapply_even_with_known_rule(db):
+    # even with the precondition rule already in memory, learning off must NOT inject the
+    # prerequisite milestones.ensure -> the bare set_milestone 422s and is not recovered.
+    memory.add_rule(db, "issues.set_milestone", "precondition",
+                    {"action": "milestones.ensure", "param": "milestone"}, learned_in_run=1)
+    client = TriageClient()                       # number NOT cached, Sprint 1 NOT in repo
+    ex = Executor(db, client, synthesizer=ensure_milestone_synth(db), learning_enabled=False)
+    steps = [
+        Step(seq=1, intent="list", operation="issues.list", kind="api", args={"filters": {"state": "open"}}),
+        Step(seq=2, intent="milestone", operation="issues.set_milestone", kind="api",
+             args={"milestone": "Sprint 1", "target": "all", "skip_if_label": "needs-triage"}),
+    ]
+    results = ex.run(run_id=1, steps=steps)
+    ops = [r.operation for r in results]
+    assert "milestones.ensure" not in ops, "no pre-applied ensure when learning is off"
+    assert ex.preapplied_rules == []
+    assert "Sprint 1" not in client.milestones
+
+
 def test_successful_run_records_steps_and_journal(db):
     client = FakeClient()
     steps = [Step(seq=1, intent="create", operation="issues.create", kind="api", args={"title": "A"})]

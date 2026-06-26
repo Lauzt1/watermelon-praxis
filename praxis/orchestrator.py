@@ -19,7 +19,7 @@ class Orchestrator:
         self.llm = llm
         self.synthesizer = synthesizer
 
-    def run(self, instruction: str) -> Report:
+    def run(self, instruction: str, learning_enabled: bool = True) -> Report:
         t0 = time.perf_counter()
 
         signature = recall.signature_for(self.db, instruction, self.llm)
@@ -29,7 +29,8 @@ class Orchestrator:
         had_cached_plan = memory.get_plan(self.db, key) is not None
         plan = planner.plan(instruction, signature, self.db, self.llm)
 
-        executor = Executor(self.db, self.client, self.synthesizer)
+        executor = Executor(self.db, self.client, self.synthesizer,
+                            learning_enabled=learning_enabled)
         results = executor.run(run_id, plan.steps)
 
         wall_ms = int((time.perf_counter() - t0) * 1000)
