@@ -219,6 +219,46 @@ def executor_learns_then_preapplies_milestone_precondition():
 
 
 @check
+def cross_instruction_milestone_transfer_via_fan_out():
+    # THE Phase 4 headline, offline: a milestones.ensure precondition rule learned by an
+    # Instruction-1 shape pre-applies on a DIFFERENT Instruction-3 fan-out shape's FIRST run
+    # (rules are keyed by OPERATION, not instruction), and the shared 'Sprint 1' number is served
+    # from ref_cache -> zero milestone-422s while every target issue lands on the milestone.
+    from praxis.executor import Executor
+    from tests.test_executor import TriageClient, ensure_milestone_synth
+    with tempfile.TemporaryDirectory() as d:
+        conn = connect(Path(d) / "x.db")
+        try:
+            client = TriageClient()                  # one persistent repo across both instructions
+            synth = ensure_milestone_synth(conn)
+            # Instruction 1 shape: create + set a single milestone by title -> learns the rule,
+            # creates + caches 'Sprint 1'.
+            i1 = [Step(seq=1, intent="create", operation="issues.create", kind="api", args={"title": "Login bug"}),
+                  Step(seq=2, intent="milestone", operation="issues.set_milestone", kind="api", args={"milestone": "Sprint 1"})]
+            Executor(conn, client, synthesizer=synth).run(run_id=1, steps=i1)
+            assert any(r["learned_in_run"] == 1 for r in memory.rules_for(conn, "issues.set_milestone")), \
+                "Instruction 1 must learn the set_milestone precondition rule"
+            assert memory.get_ref(conn, "milestone:Sprint 1") is not None, "'Sprint 1' must be cached"
+
+            # Instruction 3 shape (FIRST ever run): list + fan-out label + fan-out milestone.
+            client.milestone_422_count = 0           # measure the transfer run in isolation
+            i3 = [Step(seq=1, intent="list", operation="issues.list", kind="api", args={"filters": {"state": "open"}}),
+                  Step(seq=2, intent="label", operation="issues.add_label", kind="api", args={"label": "needs-triage", "target": "all"}),
+                  Step(seq=3, intent="milestone", operation="issues.set_milestone", kind="api", args={"milestone": "Sprint 1", "target": "all"})]
+            ex3 = Executor(conn, client, synthesizer=synth)
+            r3 = ex3.run(run_id=2, steps=i3)
+            assert client.milestone_422_count == 0, "transfer: zero milestone-422s on Instruction 3's first run"
+            assert any(p["operation"] == "issues.set_milestone" and p["learned_in_run"] == 1
+                       for p in ex3.preapplied_rules), "Instruction 3 must pre-apply the run-#1 rule"
+            assert not any(s.status == "failed" for s in r3), "no failures on the warm transfer run"
+            num = client.milestones["Sprint 1"]
+            on_ms = sorted(i["number"] for i in client.issues if i["milestone"] == num)
+            assert on_ms == [1, 2], "the fan-out set the shared milestone on every target issue"
+        finally:
+            conn.close()
+
+
+@check
 def identical_rerun_reuses_signature_and_plan_with_zero_llm():
     # the headline's plumbing: a second identical run reuses the exact-hash signature AND the
     # cached plan, so it makes ZERO LLM calls (deterministic reuse, Task 3.2).
