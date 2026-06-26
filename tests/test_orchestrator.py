@@ -41,9 +41,11 @@ def test_orchestrator_runs_end_to_end(db):
 
 
 def test_orchestrator_reuses_cached_plan(db):
-    # First run caches the plan; second run should not need the planner LLM call.
+    # First run computes + caches both the signature (by exact hash) and the winning plan;
+    # an identical second run reuses both deterministically, so it makes ZERO LLM calls.
+    # (Task 3.2: the exact-hash signature cache stops phrasing drift from flipping reuse.)
     Orchestrator(db, FakeClient(), SeqLLM([SIG, PLAN])).run("create a high priority bug issue")
-    llm2 = SeqLLM([SIG])  # only the recall call is available; a plan call would IndexError
+    llm2 = SeqLLM([])  # no payloads queued: any recall OR plan LLM call would IndexError
     report = Orchestrator(db, FakeClient(), llm2).run("create a high priority bug issue")
     assert report.status == "ok"
-    assert llm2.llm_calls == 1                        # recall only; plan served from cache
+    assert llm2.llm_calls == 0                        # signature from ref_cache + plan from cache

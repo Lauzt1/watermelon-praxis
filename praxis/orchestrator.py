@@ -22,7 +22,7 @@ class Orchestrator:
     def run(self, instruction: str) -> Report:
         t0 = time.perf_counter()
 
-        signature = recall.signature(instruction, self.llm)
+        signature = recall.signature_for(self.db, instruction, self.llm)
         key = recall.signature_key(signature)
         run_id = memory.start_run(self.db, instruction, signature)
 

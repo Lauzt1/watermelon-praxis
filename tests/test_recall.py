@@ -42,3 +42,15 @@ def test_signature_fills_missing_keys():
     sig = signature("list the issues", llm=stub)
     assert set(sig) == {"verb", "entity", "filters", "artifact"}
     assert sig["filters"] == {} and sig["artifact"] == "" and sig["entity"] == ""
+
+
+def test_signature_for_caches_by_exact_hash_skipping_the_llm(db):
+    # an identical re-run must reuse the stored signature and NOT call the canonicalisation
+    # LLM again, so the signature/plan key is deterministic across runs (Task 3.2).
+    from praxis.recall import signature_for
+    stub = _StubLLM({"verb": "create", "entity": "issue", "filters": {}, "artifact": "bug"})
+    s1 = signature_for(db, "Create a BUG", stub)
+    assert stub.llm_calls == 1
+    s2 = signature_for(db, "create   a bug", stub)        # same string, normalised
+    assert stub.llm_calls == 1, "an exact re-run must not call the signature LLM again"
+    assert s1 == s2

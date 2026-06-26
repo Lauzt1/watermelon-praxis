@@ -119,6 +119,26 @@ def test_add_label_422_learns_precondition_rule_and_retries_via_ensure(db):
     assert ex.synthesis_events and ex.synthesis_events[0]["operation"] == "labels.ensure"
 
 
+def test_labels_ensure_caches_id_then_serves_from_ref_cache(db):
+    # run 1: labels.ensure resolves/creates priority:high and caches its id (resolve-once).
+    memory.add_rule(db, "issues.add_label", "precondition",
+                    {"action": "labels.ensure", "param": "label"}, learned_in_run=1)
+    steps = [
+        Step(seq=1, intent="create", operation="issues.create", kind="api", args={"title": "X"}),
+        Step(seq=2, intent="label", operation="issues.add_label", kind="api", args={"label": "priority:high"}),
+    ]
+    c1 = LabelAwareClient(existing_labels={"bug"})
+    Executor(db, c1, synthesizer=ensure_label_synth(db)).run(run_id=1, steps=steps)
+    assert memory.get_ref(db, "label:priority:high") is not None, "the resolved label id must be cached"
+
+    # run 2 (same DB, same repo state — the label now persists in the repo): the ref-cache hit
+    # serves the id without re-running labels.ensure, so it makes ZERO label-resolve API calls.
+    c2 = LabelAwareClient(existing_labels={"bug", "priority:high"})
+    Executor(db, c2, synthesizer=ensure_label_synth(db)).run(run_id=2, steps=steps)
+    resolve_calls = [c for c in c2.calls if c["path"].endswith("/labels") and "/issues/" not in c["path"]]
+    assert resolve_calls == [], "a ref-cache hit must skip the label resolve entirely"
+
+
 def test_known_precondition_preapplies_ensure_before_add_label(db):
     # run 2 (a second executor): the rule is already in learned_rules, so labels.ensure is
     # injected BEFORE the bare add_label and the run takes zero 422s.

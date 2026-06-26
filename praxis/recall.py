@@ -15,6 +15,8 @@ import json
 import re
 from typing import Any
 
+from . import memory
+
 _SYSTEM_PROMPT = (
     "You canonicalise a GitHub task instruction into a compact, instruction-independent "
     "signature, so semantically equivalent instructions map to the same key. "
@@ -61,3 +63,17 @@ def signature(instruction: str, llm: Any) -> dict[str, Any]:
         "filters": raw.get("filters", {}) or {},
         "artifact": raw.get("artifact", ""),
     }
+
+
+def signature_for(db, instruction: str, llm: Any) -> dict[str, Any]:
+    """Exact-string fast path (spec §5): an identical re-run reuses the stored signature and
+    skips the canonicalisation LLM call, making the signature/plan key deterministic across
+    runs. The computed signature is cached in `ref_cache`, keyed by the normalised-instruction
+    hash; a hit returns it for free, so plan reuse no longer flips on LLM phrasing drift."""
+    cache_key = f"sig:{exact_hash(instruction)}"
+    cached = memory.get_ref(db, cache_key)
+    if cached is not None:
+        return json.loads(cached)
+    sig = signature(instruction, llm)
+    memory.put_ref(db, cache_key, "signature", json.dumps(sig, sort_keys=True))
+    return sig

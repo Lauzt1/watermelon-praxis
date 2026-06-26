@@ -89,9 +89,18 @@ class Executor:
             kind = "label" if op == "labels.ensure" else "milestone"
             subject = step.args.get(kind) or (step.args.get("labels") or [None])[0]
             if subject is not None:
-                self.run_refs[kind] = subject
+                self.run_refs[kind] = subject     # seed for resolve_skill_kwargs aliasing
+                cached = memory.get_ref(self.db, f"{kind}:{subject}")
+                if cached is not None:
+                    # resolve-once-cache-forever: a prior run already resolved this id, so
+                    # skip the skill and its API calls entirely (the declining call count).
+                    self.run_refs[op] = cached
+                    return cached
             result = self._dispatch_skill(step)
             self.run_refs[op] = result
+            if subject is not None:
+                value = self._ensure_ref_value(result, kind, subject)
+                memory.put_ref(self.db, f"{kind}:{subject}", kind, str(value), run_id=self.run_id)
             return result
 
         if operations.is_compound(op):
@@ -346,6 +355,20 @@ class Executor:
     def _has_rule(self, operation: str, rule_type: str, detail: dict) -> bool:
         return any(r["rule_type"] == rule_type and r["detail"] == detail
                    for r in memory.rules_for(self.db, operation))
+
+    @staticmethod
+    def _ensure_ref_value(result, kind: str, subject):
+        """Pull the resolved id/number out of a *.ensure skill's result for the ref_cache —
+        a milestone caches its number (needed to set it), a label its id; fall back to the
+        subject name itself so the cache at least records that it now exists."""
+        if isinstance(result, dict):
+            keys = ("number",) if kind == "milestone" else ("id", "node_id")
+            for k in keys + ("name", "title"):
+                if result.get(k) is not None:
+                    return result[k]
+        if isinstance(result, (str, int)):
+            return result
+        return subject
 
     # --- rollback ---------------------------------------------------------------
 

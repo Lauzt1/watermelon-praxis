@@ -152,8 +152,11 @@ def synthesis_pure_effectful_and_failure_paths():
 
 @check
 def executor_learns_then_preapplies_precondition():
-    # run 1: a bare add_label on a missing label 422s -> the precondition rule is learned and
-    # the label is created+retried. run 2 (same DB): the rule is pre-applied, zero 422s.
+    # the Phase 3 headline in miniature, against ONE persistent repo (a single client) across
+    # two runs — exactly the live gate's shape (fresh DB, same repo, twice):
+    #   run 1: a bare add_label on a missing label 422s -> learn the precondition rule,
+    #          synthesise+run labels.ensure (creates + caches the label), retry, succeed.
+    #   run 2: the rule is pre-applied and the id is served from ref_cache -> zero NEW 422s.
     from praxis.executor import Executor
     from tests.test_executor import LabelAwareClient, ensure_label_synth
     with tempfile.TemporaryDirectory() as d:
@@ -161,20 +164,51 @@ def executor_learns_then_preapplies_precondition():
         try:
             steps = [Step(seq=1, intent="c", operation="issues.create", kind="api", args={"title": "A"}),
                      Step(seq=2, intent="l", operation="issues.add_label", kind="api", args={"label": "priority:high"})]
-            r1 = Executor(conn, LabelAwareClient(existing_labels={"bug"}),
-                          synthesizer=ensure_label_synth(conn)).run(run_id=1, steps=steps)
+            client = LabelAwareClient(existing_labels={"bug"})   # priority:high missing at first
+            synth = ensure_label_synth(conn)
+            r1 = Executor(conn, client, synthesizer=synth).run(run_id=1, steps=steps)
             rules = memory.rules_for(conn, "issues.add_label")
             assert any(rr["rule_type"] == "precondition" and rr["learned_in_run"] == 1 for rr in rules), \
                 "run 1 must learn the issues.add_label precondition rule"
             assert any(s.operation == "issues.add_label" and s.status == "done" for s in r1), \
                 "add_label must succeed on the retry after labels.ensure"
+            assert memory.get_ref(conn, "label:priority:high") is not None, "the label id must be cached"
 
-            client2 = LabelAwareClient(existing_labels={"bug"})
-            r2 = Executor(conn, client2, synthesizer=ensure_label_synth(conn)).run(run_id=2, steps=steps)
-            assert client2.label_422_count == 0, "run 2 pre-applies the rule -> zero 422s"
+            client.label_422_count = 0                            # measure run 2 in isolation
+            r2 = Executor(conn, client, synthesizer=synth).run(run_id=2, steps=steps)
+            assert client.label_422_count == 0, "run 2 pre-applies the rule -> zero new 422s"
             assert not any(s.status == "failed" for s in r2), "run 2 takes no failure"
             ops = [s.operation for s in r2]
             assert ops.index("labels.ensure") < ops.index("issues.add_label"), "ensure injected first"
+        finally:
+            conn.close()
+
+
+@check
+def identical_rerun_reuses_signature_and_plan_with_zero_llm():
+    # the headline's plumbing: a second identical run reuses the exact-hash signature AND the
+    # cached plan, so it makes ZERO LLM calls (deterministic reuse, Task 3.2).
+    from praxis.config import Config
+    from praxis.orchestrator import Orchestrator
+    from tests.test_executor import FakeClient
+    sig = {"verb": "create", "entity": "issue", "filters": {}, "artifact": "bug"}
+    plan = {"steps": [{"seq": 1, "intent": "c", "operation": "issues.create",
+                       "kind": "api", "args": {"title": "A"}}]}
+
+    class SeqLLM:
+        def __init__(self, payloads):
+            self._p = list(payloads); self.llm_calls = 0; self.config = Config()
+        def complete(self, messages, **kwargs):
+            self.llm_calls += 1
+            return self._p.pop(0)
+
+    with tempfile.TemporaryDirectory() as d:
+        conn = connect(Path(d) / "r.db")
+        try:
+            Orchestrator(conn, FakeClient(), SeqLLM([sig, plan])).run("create a bug issue")
+            llm2 = SeqLLM([])  # no payloads: any recall/plan LLM call would raise
+            Orchestrator(conn, FakeClient(), llm2).run("create a bug issue")
+            assert llm2.llm_calls == 0, "an identical re-run must reuse signature + plan with no LLM"
         finally:
             conn.close()
 
