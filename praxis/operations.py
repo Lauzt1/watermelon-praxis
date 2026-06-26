@@ -76,5 +76,14 @@ VOCABULARY_HELP = (
     "  - Use canonical label names: a high-priority issue gets the label `priority:high`; an "
     "urgent one `priority:urgent`; a plain bug gets `bug`.\n"
     '  - Set a milestone by its TITLE in args as {"milestone": "<title>"} (NOT a number); the '
-    "agent resolves the title to a milestone number, creating the milestone if it does not exist."
+    "agent resolves the title to a milestone number, creating the milestone if it does not exist.\n"
+    "Bulk / fan-out rules (when the instruction enriches EVERY/ALL matching issues, e.g. "
+    "'add X to every open, unassigned, not-yet-triaged issue'):\n"
+    "  - First emit an issues.list step to fetch the candidates (put the selection in "
+    'args.filters, e.g. {"filters": {"state": "open", "assignee": "none"}}).\n'
+    '  - Then emit ONE issues.add_label / issues.set_milestone step carrying "target": "all" in '
+    "args - the agent applies it to every listed issue (do NOT emit one step per issue, and do "
+    "NOT guess issue numbers).\n"
+    '  - For a "not-yet-triaged" (or "untriaged") instruction, also add "skip_if_label": '
+    '"needs-triage" to those fan-out steps so already-triaged issues are skipped.'
 )

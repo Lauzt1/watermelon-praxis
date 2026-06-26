@@ -576,6 +576,184 @@ def test_compute_op_failed_synthesis_is_fatal(db):
     assert ex.synthesis_events and ex.synthesis_events[0]["ok"] is False
 
 
+class TriageClient:
+    """A repo with a fixed set of issues for the Instruction-3 triage fan-out. Adding a label
+    auto-creates it (never 422, per the live GitHub finding); setting a milestone by a title or a
+    nonexistent number 422s — only an existing milestone NUMBER is accepted. issues.list returns
+    the snapshot the fan-out filters over."""
+
+    def __init__(self, issues=None, existing_milestones=(), repo="o/r"):
+        self.repo = repo
+        self.api_calls = 0
+        self.journal = None
+        self.calls = []
+        self.issues = issues if issues is not None else self._default_issues()
+        self.milestones = {}             # title -> number
+        self._next_ms = 0
+        self.milestone_422_count = 0
+        for t in existing_milestones:
+            self._next_ms += 1
+            self.milestones[t] = self._next_ms
+
+    @staticmethod
+    def _default_issues():
+        # #1,#2 are open/unassigned/untriaged (the fan-out targets); #3 is assigned; #4 already
+        # carries needs-triage. Snapshot shape mirrors the real GitHub issue JSON.
+        return [
+            {"number": 1, "assignee": None, "labels": ["bug"], "milestone": None, "state": "open"},
+            {"number": 2, "assignee": None, "labels": ["documentation"], "milestone": None, "state": "open"},
+            {"number": 3, "assignee": {"login": "dev"}, "labels": ["enhancement"], "milestone": None, "state": "open"},
+            {"number": 4, "assignee": None, "labels": ["needs-triage"], "milestone": None, "state": "open"},
+        ]
+
+    def _journaled(self, op, path, body, resp):
+        if self.journal is not None:
+            inv = inverse_of(op, path, body, resp)
+            if inv is not None:
+                self.journal.append(inv)
+        return resp
+
+    def rest_get(self, path, params=None):
+        self.api_calls += 1
+        self.calls.append({"op": "rest_get", "path": path, "body": None})
+        if path.endswith("/issues") and "/issues/" not in path:
+            return [{"number": i["number"], "assignee": i["assignee"],
+                     "labels": [{"name": n} for n in i["labels"]],
+                     "milestone": ({"number": i["milestone"]} if i["milestone"] else None),
+                     "state": i["state"]}
+                    for i in self.issues if i["state"] == "open"]
+        if path.endswith("/milestones"):
+            return [{"number": n, "title": t}
+                    for t, n in sorted(self.milestones.items(), key=lambda kv: kv[1])]
+        return []
+
+    def rest_post(self, path, json=None):
+        body = json or {}
+        self.api_calls += 1
+        self.calls.append({"op": "rest_post", "path": path, "body": body})
+        if "/issues/" in path and path.endswith("/labels"):
+            num = int(path.split("/issues/")[1].split("/")[0])
+            for i in self.issues:
+                if i["number"] == num:
+                    for n in body.get("labels", []):
+                        if n not in i["labels"]:
+                            i["labels"].append(n)
+            return self._journaled("rest_post", path, body, [{"name": n} for n in body.get("labels", [])])
+        if path.endswith("/milestones"):
+            self._next_ms += 1
+            self.milestones[body["title"]] = self._next_ms
+            return self._journaled("rest_post", path, body, {"number": self._next_ms, "title": body["title"]})
+        if path.endswith("/issues"):
+            return self._journaled("rest_post", path, body, {"number": 99})
+        return self._journaled("rest_post", path, body, {})
+
+    def rest_patch(self, path, json=None):
+        body = json or {}
+        self.api_calls += 1
+        self.calls.append({"op": "rest_patch", "path": path, "body": body})
+        if "milestone" in body:
+            ms = body["milestone"]
+            if not (isinstance(ms, int) and ms in self.milestones.values()):
+                self.milestone_422_count += 1
+                raise GitHubError(422, f"invalid milestone {ms}", "rest_patch", path)
+            num = int(path.split("/issues/")[1].split("/")[0])
+            for i in self.issues:
+                if i["number"] == num:
+                    i["milestone"] = ms
+        return self._journaled("rest_patch", path, body, {})
+
+    def rest_delete(self, path, json=None):
+        self.api_calls += 1
+        self.calls.append({"op": "rest_delete", "path": path, "body": json or {}})
+        return self._journaled("rest_delete", path, json or {}, {})
+
+
+def _labeled_issue_numbers(client):
+    return sorted(int(c["path"].split("/issues/")[1].split("/")[0])
+                  for c in client.calls
+                  if c["op"] == "rest_post" and c["path"].endswith("/labels"))
+
+
+def test_add_label_fans_out_over_open_unassigned_untriaged(db):
+    # "target": "all" expands one add_label step over the issues.list snapshot, applying it to
+    # every open + unassigned issue that doesn't already carry the label (idempotency filter).
+    client = TriageClient()
+    steps = [
+        Step(seq=1, intent="list", operation="issues.list", kind="api",
+             args={"filters": {"state": "open"}}),
+        Step(seq=2, intent="triage label", operation="issues.add_label", kind="api",
+             args={"label": "needs-triage", "target": "all"}),
+    ]
+    results = Executor(db, client).run(run_id=1, steps=steps)
+    assert all(r.status == "done" for r in results)
+    # #3 is assigned, #4 already triaged -> only #1 and #2 get the label
+    assert _labeled_issue_numbers(client) == [1, 2]
+
+
+def test_add_label_fan_out_is_idempotent_on_rerun(db):
+    # a second run over the same snapshot (now all triaged) applies the label to nobody.
+    issues = [{"number": 1, "assignee": None, "labels": ["bug", "needs-triage"],
+               "milestone": None, "state": "open"}]
+    client = TriageClient(issues=issues)
+    steps = [
+        Step(seq=1, intent="list", operation="issues.list", kind="api", args={"filters": {"state": "open"}}),
+        Step(seq=2, intent="label", operation="issues.add_label", kind="api",
+             args={"label": "needs-triage", "target": "all"}),
+    ]
+    Executor(db, client).run(run_id=1, steps=steps)
+    assert _labeled_issue_numbers(client) == [], "already-triaged issues are skipped"
+
+
+def test_set_milestone_fan_out_cold_learns_then_applies_to_all(db):
+    # cold: set_milestone by title fans out, the first patch 422s -> learn the precondition,
+    # synthesise+run milestones.ensure (creates + caches Sprint 1), retry -> every target issue
+    # ends up on the resolved milestone NUMBER, zero final failures.
+    client = TriageClient()                       # Sprint 1 does not exist yet
+    ex = Executor(db, client, synthesizer=ensure_milestone_synth(db))
+    steps = [
+        Step(seq=1, intent="list", operation="issues.list", kind="api", args={"filters": {"state": "open"}}),
+        Step(seq=2, intent="milestone", operation="issues.set_milestone", kind="api",
+             args={"milestone": "Sprint 1", "target": "all", "skip_if_label": "needs-triage"}),
+    ]
+    results = ex.run(run_id=1, steps=steps)
+
+    rules = memory.rules_for(db, "issues.set_milestone")
+    assert any(r["rule_type"] == "precondition" and r["learned_in_run"] == 1 for r in rules), \
+        "the set_milestone precondition rule must be learned in run 1"
+    assert "Sprint 1" in client.milestones, "milestones.ensure created the missing milestone"
+    assert memory.get_ref(db, "milestone:Sprint 1") is not None, "the number must be cached"
+    num = client.milestones["Sprint 1"]
+    on_ms = sorted(i["number"] for i in client.issues if i["milestone"] == num)
+    assert on_ms == [1, 2], "every open/unassigned issue lands on the resolved milestone number"
+    sm = [r for r in results if r.operation == "issues.set_milestone"]
+    assert any(r.status == "done" for r in sm), "set_milestone succeeds on the retry"
+
+
+def test_set_milestone_fan_out_warm_preapplies_and_takes_zero_422(db):
+    # warm (the cross-instruction transfer): the rule is known + Sprint 1 cached -> milestones.ensure
+    # is pre-applied (ref-cache hit, no resolve API), and the fan-out patches every target with the
+    # cached NUMBER -> zero 422s.
+    memory.add_rule(db, "issues.set_milestone", "precondition",
+                    {"action": "milestones.ensure", "param": "milestone"}, learned_in_run=1)
+    memory.put_ref(db, "milestone:Sprint 1", "milestone", "1", run_id=1)
+    client = TriageClient(existing_milestones=("Sprint 1",))   # number 1 already in the repo
+    ex = Executor(db, client, synthesizer=ensure_milestone_synth(db))
+    steps = [
+        Step(seq=1, intent="list", operation="issues.list", kind="api", args={"filters": {"state": "open"}}),
+        Step(seq=2, intent="milestone", operation="issues.set_milestone", kind="api",
+             args={"milestone": "Sprint 1", "target": "all", "skip_if_label": "needs-triage"}),
+    ]
+    results = ex.run(run_id=1, steps=steps)
+
+    assert client.milestone_422_count == 0, "pre-applied rule + cached number -> zero 422s"
+    assert not any(r.status == "failed" for r in results)
+    assert ex.preapplied_rules and ex.preapplied_rules[0]["operation"] == "issues.set_milestone"
+    on_ms = sorted(i["number"] for i in client.issues if i["milestone"] == 1)
+    assert on_ms == [1, 2], "every target issue set to the cached milestone number"
+    resolve_calls = [c for c in client.calls if c["path"].endswith("/milestones")]
+    assert resolve_calls == [], "a ref-cache hit must skip the milestone resolve entirely"
+
+
 def test_successful_run_records_steps_and_journal(db):
     client = FakeClient()
     steps = [Step(seq=1, intent="create", operation="issues.create", kind="api", args={"title": "A"})]

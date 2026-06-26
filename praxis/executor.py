@@ -75,6 +75,84 @@ class Executor:
             return int(cached)
         return value
 
+    # --- bulk fan-out (Instruction 3: enrich EVERY matching issue) ---------------
+
+    # The planner signals "apply this enrichment to every listed issue" with one of these in
+    # the step's args["target"] (canonical: "all"). Synonyms tolerate planner phrasing drift.
+    _FAN_OUT_FLAGS = frozenset({"all", "all_listed", "all_open_unassigned", "all_matching", "every"})
+
+    def _wants_fan_out(self, args: dict) -> bool:
+        target = args.get("target")
+        if isinstance(target, str) and target.strip().lower() in self._FAN_OUT_FLAGS:
+            return True
+        return bool(args.get("all") or args.get("fan_out"))
+
+    def _fan_out_issues(self) -> list:
+        """The issues.list snapshot a fan-out enriches. Read from run_refs (NOT re-fetched), so
+        the 'not-yet-triaged' filter is evaluated against the pre-enrichment state and the two
+        enrichment steps see a consistent target set regardless of order."""
+        issues = self.run_refs.get("issues")
+        return issues if isinstance(issues, list) else []
+
+    @staticmethod
+    def _open_unassigned(issue: dict) -> bool:
+        return (issue.get("state", "open") == "open"
+                and issue.get("assignee") in (None, {}, ""))
+
+    @staticmethod
+    def _label_names(issue: dict) -> set:
+        return {l.get("name") for l in (issue.get("labels") or []) if isinstance(l, dict)}
+
+    def _fan_out_targets(self, args: dict, default_skip_label: str | None = None) -> list:
+        """Open + unassigned snapshot issues, minus any already carrying the 'already-triaged'
+        marker label. The planner expresses 'not-yet-triaged' as args["skip_if_label"]
+        ("needs-triage"); add_label defaults it to the label it adds (natural idempotency), and
+        set_milestone inherits it from a preceding add_label fan-out — so both enrichment steps
+        select the identical set regardless of order."""
+        skip_label = args.get("skip_if_label", default_skip_label)
+        targets = []
+        for issue in self._fan_out_issues():
+            if issue.get("number") is None or not self._open_unassigned(issue):
+                continue
+            if skip_label is not None and skip_label in self._label_names(issue):
+                continue
+            targets.append(issue)
+        return targets
+
+    def _fan_out_add_label(self, args: dict) -> dict:
+        """Add the label to every not-yet-triaged open + unassigned snapshot issue. Labels
+        auto-create, so no 422. Records the label as the run's triage marker so a later
+        set_milestone fan-out skips the same already-triaged issues."""
+        repo = self.client.repo
+        label = args.get("label") or (args.get("labels") or [None])[0]
+        self.run_refs["triage_label"] = label
+        applied = []
+        for issue in self._fan_out_targets(args, default_skip_label=label):
+            num = issue["number"]
+            self.client.rest_post(f"/repos/{repo}/issues/{num}/labels", json={"labels": [label]})
+            applied.append(num)
+        return {"fan_out": "issues.add_label", "label": label, "applied": applied}
+
+    def _fan_out_set_milestone(self, args: dict) -> dict:
+        """Set the milestone on every not-yet-triaged open + unassigned snapshot issue not already
+        on it. On the cold path the title is unresolved -> the first PATCH 422s and raises,
+        triggering the learn-and-retry; on retry (and on the warm path) the resolved NUMBER is
+        applied to all."""
+        repo = self.client.repo
+        resolved = self._resolve_milestone(args.get("milestone"))
+        applied, skipped = [], []
+        for issue in self._fan_out_targets(args, default_skip_label=self.run_refs.get("triage_label")):
+            num = issue["number"]
+            current = issue.get("milestone")
+            current_num = current.get("number") if isinstance(current, dict) else current
+            if isinstance(resolved, int) and current_num == resolved:
+                skipped.append(num)
+                continue
+            self.client.rest_patch(f"/repos/{repo}/issues/{num}", json={"milestone": resolved})
+            applied.append(num)
+        return {"fan_out": "issues.set_milestone", "milestone": resolved,
+                "applied": applied, "skipped": skipped}
+
     def _dispatch(self, step: Step) -> Any:
         op, args, repo = step.operation, step.args, self.client.repo
 
@@ -86,10 +164,14 @@ class Executor:
                 self.run_refs["last_issue"] = resp["number"]
             return resp
         if op == "issues.add_label":
+            if self._wants_fan_out(args):
+                return self._fan_out_add_label(args)
             issue = self._issue_target(args)
             labels = args.get("labels") or [args["label"]]
             return self.client.rest_post(f"/repos/{repo}/issues/{issue}/labels", json={"labels": labels})
         if op == "issues.set_milestone":
+            if self._wants_fan_out(args):
+                return self._fan_out_set_milestone(args)
             issue = self._issue_target(args)
             milestone = self._resolve_milestone(args.get("milestone"))
             return self.client.rest_patch(f"/repos/{repo}/issues/{issue}", json={"milestone": milestone})
