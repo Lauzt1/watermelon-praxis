@@ -73,7 +73,53 @@ def test_complete_defaults_to_planner_model():
 
 
 def test_complete_raises_on_none_content():
-    # reasoning model returned only chain-of-thought; content is None
+    # reasoning model returned only chain-of-thought; content is None on every attempt
     llm = _llm(None)
     with pytest.raises(LLMError):
         llm.complete([{"role": "user", "content": "x"}])
+
+
+class _SeqCompletions:
+    def __init__(self, contents):
+        self._contents = list(contents)
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return _Completion(self._contents.pop(0))
+
+
+class SeqOpenAI:
+    """Returns a different content per call, so the retry path can be exercised offline."""
+
+    def __init__(self, contents):
+        self.chat = type("C", (), {"completions": _SeqCompletions(contents)})()
+
+
+def _seq_llm(contents):
+    return LLM(config=Config(), client=SeqOpenAI(contents))
+
+
+def test_complete_retries_on_none_then_succeeds():
+    # a reasoning model that ate its budget once recovers on a retry with more room
+    llm = _seq_llm([None, '{"verb": "v", "entity": "e"}'])
+    out = llm.complete([{"role": "user", "content": "x"}])
+    assert out == {"verb": "v", "entity": "e"}
+    assert llm.llm_calls == 2, "the retry is a real call and is counted"
+    calls = llm._client.chat.completions.calls
+    assert calls[1]["max_tokens"] > calls[0]["max_tokens"], "retry raises the token budget"
+
+
+def test_complete_retries_on_truncated_json_then_succeeds():
+    # the flash planner sometimes truncates its JSON (unterminated string) -> retry recovers
+    llm = _seq_llm(['{"verb": "v", "entity":', '{"verb": "v", "entity": "e"}'])
+    out = llm.complete([{"role": "user", "content": "x"}])
+    assert out == {"verb": "v", "entity": "e"}
+    assert llm.llm_calls == 2
+
+
+def test_complete_raises_after_retries_exhausted():
+    llm = _seq_llm([None, None])
+    with pytest.raises(LLMError):
+        llm.complete([{"role": "user", "content": "x"}])
+    assert llm.llm_calls == 2, "exactly two attempts, then give up"
