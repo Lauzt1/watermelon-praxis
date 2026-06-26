@@ -139,6 +139,61 @@ def rules_for(db: sqlite3.Connection, operation: str) -> list[dict[str, Any]]:
     ]
 
 
+# --- inspection readers (the `memory` CLI before/after view) ---------------------
+
+def all_rules(db: sqlite3.Connection, operation: str | None = None) -> list[dict[str, Any]]:
+    sql = ("SELECT operation, rule_type, detail_json, learned_in_run, confidence "
+           "FROM learned_rules")
+    params: tuple = ()
+    if operation is not None:
+        sql += " WHERE operation=?"
+        params = (operation,)
+    rows = db.execute(sql + " ORDER BY id", params).fetchall()
+    return [
+        {"operation": r["operation"], "rule_type": r["rule_type"],
+         "detail": json.loads(r["detail_json"]), "learned_in_run": r["learned_in_run"],
+         "confidence": r["confidence"]}
+        for r in rows
+    ]
+
+
+def all_refs(db: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = db.execute(
+        "SELECT key, kind, value, run_id FROM ref_cache ORDER BY key"
+    ).fetchall()
+    return [{"key": r["key"], "kind": r["kind"], "value": r["value"], "run_id": r["run_id"]}
+            for r in rows]
+
+
+def all_op_stats(db: sqlite3.Connection, operation: str | None = None) -> list[dict[str, Any]]:
+    sql = ("SELECT operation, uses, successes, failures, avg_latency_ms, last_used "
+           "FROM op_stats")
+    params: tuple = ()
+    if operation is not None:
+        sql += " WHERE operation=?"
+        params = (operation,)
+    rows = db.execute(sql + " ORDER BY operation", params).fetchall()
+    return [
+        {"operation": r["operation"], "uses": r["uses"], "successes": r["successes"],
+         "failures": r["failures"], "avg_latency_ms": r["avg_latency_ms"], "last_used": r["last_used"]}
+        for r in rows
+    ]
+
+
+def all_skills(db: sqlite3.Connection, name: str | None = None) -> list[dict[str, Any]]:
+    sql = "SELECT name, status, version, uses, successes, failures FROM skills"
+    params: tuple = ()
+    if name is not None:
+        sql += " WHERE name=?"
+        params = (name,)
+    rows = db.execute(sql + " ORDER BY name", params).fetchall()
+    return [
+        {"name": r["name"], "status": r["status"], "version": r["version"],
+         "uses": r["uses"], "successes": r["successes"], "failures": r["failures"]}
+        for r in rows
+    ]
+
+
 # --- skills ---------------------------------------------------------------------
 
 def put_skill(db: sqlite3.Connection, name: str, contract: SkillContract | dict, code: str,

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from . import memory
 from .config import Config, load
 from .db import connect
 from .llm import LLM
@@ -30,6 +31,54 @@ def cmd_run(args: argparse.Namespace, config: Config) -> None:
         print(report.model_dump_json(indent=2) if args.json else render(report))
     finally:
         client.close()
+        conn.close()
+
+
+def render_memory(db, operation: str | None = None) -> str:
+    """Format the persistent memory for the `memory` command — the before/after view the
+    brief asks for: learned rules, the resolved-id cache, per-operation stats, and the
+    synthesised-skill registry. Pure reader, so it is testable offline."""
+    head = "Praxis memory" + (f" - operation {operation}" if operation else "")
+    lines = [head]
+
+    lines.append("\nlearned_rules:")
+    rules = memory.all_rules(db, operation)
+    if not rules:
+        lines.append("  (none)")
+    for r in rules:
+        lines.append(f"  [{r['operation']}] {r['rule_type']}: {r['detail']} "
+                     f"(learned in run #{r['learned_in_run']}, confidence {r['confidence']})")
+
+    lines.append("\nref_cache:")
+    refs = memory.all_refs(db)
+    if not refs:
+        lines.append("  (none)")
+    for r in refs:
+        lines.append(f"  {r['key']} = {r['value']}  ({r['kind']}, run #{r['run_id']})")
+
+    lines.append("\nop_stats:")
+    stats = memory.all_op_stats(db, operation)
+    if not stats:
+        lines.append("  (none)")
+    for s in stats:
+        lines.append(f"  {s['operation']}: uses={s['uses']} ok={s['successes']} "
+                     f"fail={s['failures']} avg_ms={s['avg_latency_ms']:.0f}")
+
+    lines.append("\nskills:")
+    skills = memory.all_skills(db, operation)
+    if not skills:
+        lines.append("  (none)")
+    for s in skills:
+        lines.append(f"  {s['name']} [{s['status']} v{s['version']}] "
+                     f"uses={s['uses']} ok={s['successes']} fail={s['failures']}")
+    return "\n".join(lines)
+
+
+def cmd_memory(args: argparse.Namespace, config: Config) -> None:
+    conn = connect(config.db_path)
+    try:
+        print(render_memory(conn, getattr(args, "operation", None)))
+    finally:
         conn.close()
 
 
@@ -86,11 +135,16 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser("doctor", help="check keys, DB/schema, and GitHub access")
 
+    p_mem = sub.add_parser("memory", help="inspect learned rules, ref-cache, op-stats, skills")
+    p_mem.add_argument("--operation", help="filter rules/op-stats/skills to one operation")
+
     args = parser.parse_args(argv)
     if args.command == "run":
         cmd_run(args, config)
     elif args.command == "doctor":
         cmd_doctor(args, config)
+    elif args.command == "memory":
+        cmd_memory(args, config)
 
 
 if __name__ == "__main__":
