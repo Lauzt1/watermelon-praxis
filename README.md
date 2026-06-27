@@ -20,6 +20,11 @@ python -m venv .venv
 cp .env.example .env                                # then set the three required keys below
 ```
 
+The editable install registers a **`praxis`** command, so you can run `praxis doctor`,
+`praxis seed`, `praxis run "..."` directly (use `.venv/Scripts/praxis ...`, or just
+`praxis ...` once the venv is activated). The explicit `python -m praxis.main ...` form
+below works identically and needs no activation.
+
 `.env` keys (see `.env.example`) — the first three are **required**; the rest have working defaults:
 
 ```dotenv
