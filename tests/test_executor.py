@@ -732,6 +732,49 @@ def test_add_label_fan_out_is_idempotent_on_rerun(db):
     assert _labeled_issue_numbers(client) == [], "already-triaged issues are skipped"
 
 
+class LabelFilterAwareTriageClient(TriageClient):
+    """Like TriageClient, but its issues.list HONORS the GitHub `labels` query param as an
+    INCLUSION filter (returns only issues that HAVE every listed label) — GitHub's real
+    semantics, which has NO negation. Proves the executor must not forward a label-EXCLUSION
+    intent (a planner's 'not-yet-triaged') to the list API, where it would invert the meaning
+    and zero out the fan-out snapshot."""
+
+    def rest_get(self, path, params=None):
+        if path.endswith("/issues") and "/issues/" not in path:
+            self.api_calls += 1
+            self.calls.append({"op": "rest_get", "path": path, "body": None})
+            want = (params or {}).get("labels")
+            want_list = want if isinstance(want, list) else ([want] if want else [])
+            return [{"number": i["number"], "assignee": i["assignee"],
+                     "labels": [{"name": n} for n in i["labels"]],
+                     "milestone": ({"number": i["milestone"]} if i["milestone"] else None),
+                     "state": i["state"]}
+                    for i in self.issues
+                    if i["state"] == "open" and all(w in i["labels"] for w in want_list)]
+        return super().rest_get(path, params)
+
+
+def test_list_label_exclusion_is_not_forwarded_to_the_list_api(db):
+    # the Instruction-3 bug a live run surfaced: the planner expresses "not-yet-triaged" as a
+    # label EXCLUSION on the list step (labels=[needs-triage] + label_mode="none"). GitHub's list
+    # API has no negation, so forwarding it verbatim returns the issues that HAVE the label (here
+    # only #4) and the fan-out enriches nobody — a silent no-op. The exclusion must be applied
+    # client-side (skip_if_label) against the pre-enrichment snapshot, not sent to the API.
+    client = LabelFilterAwareTriageClient()
+    steps = [
+        Step(seq=1, intent="list open unassigned not-yet-triaged", operation="issues.list",
+             kind="api", args={"filters": {"state": "open", "assignee": "none",
+                                           "labels": ["needs-triage"], "label_mode": "none"}}),
+        Step(seq=2, intent="triage label", operation="issues.add_label", kind="api",
+             args={"label": "needs-triage", "target": "all", "skip_if_label": "needs-triage"}),
+    ]
+    results = Executor(db, client).run(run_id=1, steps=steps)
+    assert all(r.status == "done" for r in results)
+    # #1,#2 are open/unassigned/untriaged -> they must get the label (#3 assigned, #4 already triaged)
+    assert _labeled_issue_numbers(client) == [1, 2], \
+        "a label-exclusion on the list step must not zero out the fan-out snapshot"
+
+
 def test_set_milestone_fan_out_cold_learns_then_applies_to_all(db):
     # cold: set_milestone by title fans out, the first patch 422s -> learn the precondition,
     # synthesise+run milestones.ensure (creates + caches Sprint 1), retry -> every target issue

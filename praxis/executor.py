@@ -157,6 +157,36 @@ class Executor:
         return {"fan_out": "issues.set_milestone", "milestone": resolved,
                 "applied": applied, "skipped": skipped}
 
+    # The query params GitHub's "list repository issues" endpoint actually understands. Anything
+    # else a planner invents (e.g. "label_mode") must be dropped, never forwarded to the API.
+    _GH_LIST_PARAMS = frozenset({
+        "milestone", "state", "assignee", "creator", "mentioned", "labels",
+        "since", "sort", "direction", "per_page", "page", "filter",
+    })
+    # Planner phrasings that mean "exclude these labels" (i.e. not-yet-triaged). GitHub's list
+    # endpoint has NO label negation, so under any of these we must NOT send `labels` as an
+    # inclusion filter — the exclusion is applied client-side by the fan-out's skip_if_label.
+    _LABEL_EXCLUSION_MODES = frozenset({"none", "not", "exclude", "without", "negate", "absent"})
+
+    @classmethod
+    def _sanitize_list_filters(cls, filters):
+        """Keep only GitHub-recognized list params, and strip a label-EXCLUSION so it never reaches
+        the API as an inclusion. The planner expresses 'not-yet-triaged' as labels=[X]+label_mode=
+        "none" (or a '!'-prefixed label); forwarded verbatim that returns the issues that HAVE X —
+        the exact opposite — emptying the fan-out snapshot into a silent no-op. Exclusion is the
+        fan-out's job (skip_if_label) against the pre-enrichment snapshot, not the list query's."""
+        if not isinstance(filters, dict):
+            return filters
+        mode = str(filters.get("label_mode", "")).strip().lower()
+        raw = filters.get("labels", filters.get("label"))
+        label_list = raw if isinstance(raw, list) else ([raw] if raw else [])
+        excluding = (mode in cls._LABEL_EXCLUSION_MODES
+                     or any(isinstance(l, str) and l.strip().startswith("!") for l in label_list))
+        clean = {k: v for k, v in filters.items() if k in cls._GH_LIST_PARAMS}
+        if excluding:
+            clean.pop("labels", None)
+        return clean
+
     def _dispatch(self, step: Step) -> Any:
         op, args, repo = step.operation, step.args, self.client.repo
 
@@ -180,7 +210,8 @@ class Executor:
             milestone = self._resolve_milestone(args.get("milestone"))
             return self.client.rest_patch(f"/repos/{repo}/issues/{issue}", json={"milestone": milestone})
         if op == "issues.list":
-            resp = self.client.rest_get(f"/repos/{repo}/issues", params=args.get("filters") or args or None)
+            filters = self._sanitize_list_filters(args.get("filters") or args)
+            resp = self.client.rest_get(f"/repos/{repo}/issues", params=filters or None)
             self.run_refs["issues"] = resp        # thread the list to a downstream compute step
             return resp
 
