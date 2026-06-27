@@ -7,3 +7,5 @@ data/
 learning_*.csv
 .pytest_cache/
 .venv/
+# confidential assignment brief — kept locally, never committed/published
+docs/*.pdf
