@@ -11,6 +11,8 @@ learning_*.csv
 docs/*.pdf
 # lightweight local summary of the confidential brief — same confidentiality as the PDF
 docs/BRIEF.md
+# local operational runbook (how to run + demo-prep) — kept private, not part of the submission
+docs/RUNBOOK.md
 # internal planning docs — kept locally, excluded from the public submission repo
 docs/superpowers/
 CLAUDE.md
