@@ -17,18 +17,18 @@ Requires Python 3.11+ (developed on 3.12). Two separate repos: this repo is the 
 ```bash
 python -m venv .venv
 .venv/Scripts/python -m pip install -e ".[dev]"     # Windows; use .venv/bin/python on POSIX
-cp .env.example .env                                # then fill in the four secrets below
+cp .env.example .env                                # then set the three required keys below
 ```
 
-`.env` keys (see `.env.example`):
+`.env` keys (see `.env.example`) — the first three are **required**; the rest have working defaults:
 
 ```dotenv
-OPENROUTER_API_KEY=sk-or-...           # OpenRouter key (LLM access)
-GITHUB_TOKEN=ghp_...                   # PAT with repo scope on the sandbox repo
-GITHUB_REPO=your-name/praxis-sandbox   # the disposable target repo
-PRAXIS_MODEL_WORKHORSE=deepseek/deepseek-v4-pro     # synthesis (reasoning model)
-PRAXIS_MODEL_PLANNER=deepseek/deepseek-v4-flash     # planning + recall (reasoning model)
-PRAXIS_DB=data/praxis.db               # created at runtime; gitignored
+OPENROUTER_API_KEY=sk-or-...           # required — OpenRouter key (LLM access)
+GITHUB_TOKEN=ghp_...                   # required — PAT with repo scope on the sandbox repo
+GITHUB_REPO=your-name/praxis-sandbox   # required — the disposable target repo
+PRAXIS_MODEL_WORKHORSE=deepseek/deepseek-v4-pro     # optional — synthesis (reasoning model)
+PRAXIS_MODEL_PLANNER=deepseek/deepseek-v4-flash     # optional — planning + recall (reasoning model)
+PRAXIS_DB=data/praxis.db               # optional — created at runtime; gitignored
 ```
 
 ## Single-command run
