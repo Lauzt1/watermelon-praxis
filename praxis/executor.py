@@ -415,6 +415,21 @@ class Executor:
         return Step(seq=step.seq, intent=f"ensure prerequisite for {step.operation}",
                     operation=prereq_op, kind="api", args={param: subject})
 
+    def _evict_stale_ref(self, rule: dict, step: Step) -> None:
+        """Drop the ref_cache entry for a precondition's subject, so the prerequisite *.ensure
+        re-resolves it live. The cached id only reaches here after a 422 proved it unusable
+        (e.g. a milestone number that was deleted)."""
+        action = rule.get("action", "")
+        kind = {"labels.ensure": "label", "milestones.ensure": "milestone"}.get(action)
+        if kind is None:
+            return
+        subject = step.args.get(rule.get("param"))
+        if subject is None:
+            labels = step.args.get("labels")
+            subject = labels[0] if labels else None
+        if subject is not None:
+            memory.del_ref(self.db, f"{kind}:{subject}")
+
     def _maybe_recover(self, step: Step, error, failed_res: StepResult) -> bool:
         """A planned step failed; if it is a discoverable constraint (a 422/404 on a bare
         enrichment op), learn the precondition rule, inject + run the prerequisite (synthesised
@@ -436,6 +451,10 @@ class Executor:
             f"missing prerequisite (HTTP {getattr(error, 'status_code', '?')}); learned "
             f"precondition rule -> {prereq_op}; pre-applied it and retried"
         )
+        # the cached id may be STALE — the underlying object was deleted on the platform, which
+        # is exactly why this 422'd. Evict it so the injected *.ensure re-resolves against the
+        # live repo instead of short-circuiting to the dead id again (self-heal, not a 422 loop).
+        self._evict_stale_ref(rule, step)
         prereq = self._build_prerequisite(step, rule)
         if prereq is None:
             return False

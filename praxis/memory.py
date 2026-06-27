@@ -86,6 +86,13 @@ def get_ref(db: sqlite3.Connection, key: str) -> str | None:
     return row["value"] if row else None
 
 
+def del_ref(db: sqlite3.Connection, key: str) -> None:
+    """Drop a cached id/number — used when it turns out stale (the underlying object was
+    deleted on the platform), so the next *.ensure re-resolves against the live state."""
+    db.execute("DELETE FROM ref_cache WHERE key=?", (key,))
+    db.commit()
+
+
 # --- op_stats -------------------------------------------------------------------
 
 def bump_op_stats(db: sqlite3.Connection, operation: str, success: bool, latency_ms: int) -> None:

@@ -232,6 +232,34 @@ def test_known_milestone_precondition_preapplies_and_resolves_number(db):
     assert resolve_calls == [], "a ref-cache hit must skip the milestone resolve entirely"
 
 
+def test_stale_cached_milestone_number_self_heals_on_422(db):
+    # the bug a real run surfaced: ref_cache holds a milestone NUMBER that was since deleted on
+    # the platform (live "Sprint 1" is now a different number). The cached id must not loop on
+    # 422 forever — on the 422 the executor evicts the stale ref, re-runs milestones.ensure
+    # against the LIVE repo (cache miss -> resolve), and the retry succeeds with the right number.
+    memory.add_rule(db, "issues.set_milestone", "precondition",
+                    {"action": "milestones.ensure", "param": "milestone"}, learned_in_run=1)
+    memory.put_ref(db, "milestone:Sprint 1", "milestone", "2", run_id=1)   # STALE: #2 was deleted
+    client = MilestoneAwareClient(existing_titles=("Sprint 1",))           # live "Sprint 1" == #1
+    ex = Executor(db, client, synthesizer=ensure_milestone_synth(db))
+    steps = [
+        Step(seq=1, intent="create", operation="issues.create", kind="api", args={"title": "X"}),
+        Step(seq=2, intent="milestone", operation="issues.set_milestone", kind="api",
+             args={"milestone": "Sprint 1"}),
+    ]
+    results = ex.run(run_id=2, steps=steps)
+
+    sm = [r for r in results if r.operation == "issues.set_milestone"]
+    assert any(r.status == "done" for r in sm), "set_milestone must self-heal and succeed, not loop on 422"
+    live_number = client.milestones["Sprint 1"]
+    assert memory.get_ref(db, "milestone:Sprint 1") == str(live_number), \
+        "the stale ref must be replaced with the live milestone number"
+    patches = [c for c in client.calls
+               if c["op"] == "rest_patch" and isinstance(c["body"].get("milestone"), int)]
+    assert patches and patches[-1]["body"]["milestone"] == live_number, \
+        "the successful PATCH must use the re-resolved live number, not the stale cached one"
+
+
 def test_add_label_422_learns_precondition_rule_and_retries_via_ensure(db):
     # run 1: a bare add_label on a missing label 422s -> the executor extracts the
     # precondition rule, persists it (learned_in_run=1), injects + synthesises labels.ensure,

@@ -219,6 +219,32 @@ def executor_learns_then_preapplies_milestone_precondition():
 
 
 @check
+def stale_cached_milestone_number_self_heals():
+    # robustness (surfaced by a real run): a ref_cache milestone number can go stale when the
+    # milestone is deleted on the platform. The cached id must not loop on 422 forever — on the
+    # 422 the executor evicts the stale ref, re-resolves milestones.ensure against the live repo,
+    # and the retry succeeds with the correct number.
+    from praxis.executor import Executor
+    from tests.test_executor import MilestoneAwareClient, ensure_milestone_synth
+    with tempfile.TemporaryDirectory() as d:
+        conn = connect(Path(d) / "stale.db")
+        try:
+            memory.add_rule(conn, "issues.set_milestone", "precondition",
+                            {"action": "milestones.ensure", "param": "milestone"}, learned_in_run=1)
+            memory.put_ref(conn, "milestone:Sprint 1", "milestone", "2", run_id=1)  # STALE: #2 gone
+            client = MilestoneAwareClient(existing_titles=("Sprint 1",))             # live == #1
+            steps = [Step(seq=1, intent="c", operation="issues.create", kind="api", args={"title": "X"}),
+                     Step(seq=2, intent="m", operation="issues.set_milestone", kind="api", args={"milestone": "Sprint 1"})]
+            results = Executor(conn, client, synthesizer=ensure_milestone_synth(conn)).run(run_id=2, steps=steps)
+            sm = [r for r in results if r.operation == "issues.set_milestone"]
+            assert any(r.status == "done" for r in sm), "stale cached number must self-heal, not loop on 422"
+            assert memory.get_ref(conn, "milestone:Sprint 1") == str(client.milestones["Sprint 1"]), \
+                "the stale ref must be replaced with the live milestone number"
+        finally:
+            conn.close()
+
+
+@check
 def cross_instruction_milestone_transfer_via_fan_out():
     # THE Phase 4 headline, offline: a milestones.ensure precondition rule learned by an
     # Instruction-1 shape pre-applies on a DIFFERENT Instruction-3 fan-out shape's FIRST run
