@@ -9,6 +9,8 @@ learning_*.csv
 .venv/
 # confidential assignment brief — kept locally, never committed/published
 docs/*.pdf
+# lightweight local summary of the confidential brief — same confidentiality as the PDF
+docs/BRIEF.md
 # internal planning docs — kept locally, excluded from the public submission repo
 docs/superpowers/
 CLAUDE.md
