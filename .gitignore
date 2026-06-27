@@ -15,4 +15,6 @@ docs/BRIEF.md
 docs/RUNBOOK.md
 # internal planning docs — kept locally, excluded from the public submission repo
 docs/superpowers/
+# per-agent working instructions (point at the confidential brief) — local only, not submission
 CLAUDE.md
+AGENTS.md
