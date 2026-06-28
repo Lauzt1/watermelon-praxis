@@ -127,6 +127,38 @@ def cmd_memory(args: argparse.Namespace, config: Config) -> None:
         conn.close()
 
 
+def render_skills(db) -> str:
+    """The capability-memory view: every synthesised skill with its health score (spec §7.1)."""
+    skills = memory.all_skills(db)
+    if not skills:
+        return "skills: (none registered yet)"
+    lines = ["Praxis skills (capability memory):"]
+    for s in skills:
+        conf = memory.skill_confidence(s["uses"], s["successes"])
+        lines.append(f"  {s['name']} [{s['status']} v{s['version']}] "
+                     f"conf={conf:.2f} uses={s['uses']} ok={s['successes']} fail={s['failures']}")
+    return "\n".join(lines)
+
+
+def cmd_skills(args: argparse.Namespace, config: Config) -> None:
+    conn = connect(config.db_path)
+    try:
+        if getattr(args, "break_skill", None):
+            skill = memory.get_skill(conn, args.break_skill)
+            if skill is None:
+                print(f"skills: no skill named {args.break_skill!r}")
+                return
+            memory.put_skill(conn, args.break_skill, skill["contract"],
+                             "def skill(client, **kwargs):\n    raise RuntimeError('simulated drift')",
+                             status="quarantined", version=skill["version"])
+            print(f"skills: broke {args.break_skill!r} (status=quarantined, code corrupted) "
+                  f"- the next run that needs it will self-heal it")
+            return
+        print(render_skills(conn))
+    finally:
+        conn.close()
+
+
 def _signature_for(conn, instruction: str, config: Config) -> dict:
     """Resolve the instruction's signature. For an already-run instruction this is served from
     the exact-hash cache (no LLM/key needed); otherwise it costs one canonicalisation call."""
@@ -265,6 +297,11 @@ def main(argv: list[str] | None = None) -> None:
     p_compact.add_argument("--keep-recent", type=int, default=50,
                            help="how many most-recent runs keep their step detail (default 50)")
 
+    p_skills = sub.add_parser("skills",
+                              help="list synthesised skills + health; --break NAME to demo self-healing")
+    p_skills.add_argument("--break", dest="break_skill", metavar="NAME",
+                          help="simulate drift: quarantine a skill + corrupt its code so the next run heals it")
+
     args = parser.parse_args(argv)
     if args.command == "run":
         cmd_run(args, config)
@@ -282,6 +319,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_curve(args, config)
     elif args.command == "compact":
         cmd_compact(args, config)
+    elif args.command == "skills":
+        cmd_skills(args, config)
 
 
 if __name__ == "__main__":

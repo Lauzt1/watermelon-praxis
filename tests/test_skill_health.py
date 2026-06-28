@@ -98,3 +98,21 @@ def test_render_memory_shows_skill_confidence(db):
     from praxis.main import render_memory
     _register(db)
     assert "conf=1.00" in render_memory(db)
+
+
+def test_render_skills_lists_health(db):
+    from praxis.main import render_skills
+    _register(db)
+    out = render_skills(db)
+    assert "compute.demo" in out and "conf=1.00" in out
+
+
+def test_break_skill_quarantines_and_corrupts(db):
+    # `skills --break` at the memory layer: quarantine + replace code with a crashing stub
+    name = _register(db)
+    skill = memory.get_skill(db, name)
+    memory.put_skill(db, name, skill["contract"],
+                     "def skill(client, **kwargs):\n    raise RuntimeError('simulated drift')",
+                     status="quarantined", version=skill["version"])
+    after = memory.get_skill(db, name)
+    assert after["status"] == "quarantined" and "simulated drift" in after["code"]
