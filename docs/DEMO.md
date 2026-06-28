@@ -48,6 +48,22 @@ the showcase skill is still synthesised **live** in the demo to prove synthesis 
   table. The report carries the synthesis event; re-running reuses the skill with **0** synthesis
   LLM calls.
 
+## Skill self-healing (nice-to-have #2 — the capability layer learns)
+
+```bash
+.venv/Scripts/python -m praxis.main skills                              # health table: each skill's status/version/conf
+.venv/Scripts/python -m praxis.main skills --break compute.group_by_label_and_render_table
+.venv/Scripts/python -m praxis.main run "Find all open issues with no assignee, group them by label, and create a triage summary issue listing them"
+```
+
+- `skills --break` simulates platform drift: it quarantines the showcase skill and corrupts its
+  stored code. On the **next run** the executor sees the quarantine and **re-synthesises a working v2**
+  (tested in-memory on the run's real issues) instead of running the broken code — the report shows
+  `Skill health: … healed -> v2` and a synthesis event with `heal: True`, and a real triage issue is
+  still posted. `skills` afterward shows `[active v2] conf=1.00`. Measurable: `confidence` recovers and
+  `failure_count` stays 0 on the healed run. (The natural path — auto-quarantine after a skill's
+  success rate falls below 0.5 over ≥3 uses — is proven offline in `tests/test_skill_health.py`.)
+
 ## Instruction 3 — Synthesis + transfer (THE headline)
 
 ```bash
