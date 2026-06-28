@@ -24,6 +24,11 @@ from .platform.github import GitHubError
 # clean failure instead of a hang.
 SKILL_TIMEOUT_S = 20.0
 
+# Skill-health governance (spec §7.1): a skill used at least MIN_SAMPLES times that succeeds
+# less than THRESHOLD of the time is quarantined, then re-synthesised on its next use.
+SKILL_MIN_SAMPLES = 3
+SKILL_CONFIDENCE_THRESHOLD = 0.5
+
 
 class ExecutorError(Exception):
     """Raised for an operation the executor cannot dispatch (unknown, or a compound op
@@ -48,6 +53,8 @@ class Executor:
         self.synthesis_events: list[dict[str, Any]] = []
         # Learned precondition rules pre-applied this run (the cross-run transfer evidence).
         self.preapplied_rules: list[dict[str, Any]] = []
+        # Skill quarantine/heal events recorded this run, surfaced by the reporter (spec §7.1).
+        self.skill_health_events: list[dict[str, Any]] = []
 
     # --- dispatch ---------------------------------------------------------------
 
@@ -276,8 +283,11 @@ class Executor:
         return body
 
     def _dispatch_skill(self, step: Step) -> Any:
-        """Look up the skill; synthesise it on first use; then compile + run it sandboxed."""
+        """Look up the skill; self-heal it if quarantined; synthesise it on first use; then
+        compile + run it sandboxed, recording the outcome into its health stats (spec §7.1)."""
         skill = memory.get_skill(self.db, step.operation)
+        if skill is not None and skill["status"] == "quarantined":
+            skill = self._heal_quarantined(step, skill)   # rebuild before use, or raise
         if skill is None:
             if self.synthesizer is None:
                 raise ExecutorError(
@@ -301,7 +311,57 @@ class Executor:
 
         fn = sandbox.compile_skill(skill["code"])
         kwargs = self._skill_kwargs(step, skill["contract"])
-        return sandbox.run_skill(fn, client=self.client, kwargs=kwargs, timeout_s=SKILL_TIMEOUT_S)
+        try:
+            result = sandbox.run_skill(fn, client=self.client, kwargs=kwargs,
+                                       timeout_s=SKILL_TIMEOUT_S)
+        except Exception:
+            self._record_skill_outcome(step.operation, success=False)
+            raise
+        self._record_skill_outcome(step.operation, success=True)
+        return result
+
+    def _record_skill_outcome(self, operation: str, success: bool) -> None:
+        """Update the skill's health counters and, when learning is on, quarantine it if its
+        success rate has fallen below threshold (spec §7.1)."""
+        memory.bump_skill_stats(self.db, operation, success)
+        if self.learning_enabled:
+            self._maybe_quarantine(operation)
+
+    def _maybe_quarantine(self, operation: str) -> None:
+        skill = memory.get_skill(self.db, operation)
+        if skill is None or skill["status"] != "active":
+            return
+        conf = memory.skill_confidence(skill["uses"], skill["successes"])
+        if skill["uses"] >= SKILL_MIN_SAMPLES and conf < SKILL_CONFIDENCE_THRESHOLD:
+            memory.set_skill_status(self.db, operation, "quarantined")
+            self.skill_health_events.append({
+                "operation": operation, "event": "quarantined",
+                "version": skill["version"], "confidence": round(conf, 2),
+            })
+
+    def _heal_quarantined(self, step: Step, skill: dict) -> dict:
+        """Re-synthesise a quarantined skill (version+1) before it is ever run again. Returns
+        the fresh active skill row, or raises so the failure surfaces through the §9 policy."""
+        new_version = skill["version"] + 1
+        if self.synthesizer is None or not self.learning_enabled:
+            raise ExecutorError(f"skill {step.operation!r} is quarantined and healing is off")
+        result = self.synthesizer(step, self.run_refs)   # reason -> build -> test -> re-register
+        healed = bool(getattr(result, "ok", False))
+        self.synthesis_events.append({
+            "operation": step.operation, "ok": healed, "heal": True,
+            "version": new_version,
+            "attempts": len(getattr(result, "attempts", []) or []),
+        })
+        if not healed:
+            raise ExecutorError(
+                f"skill {step.operation!r} quarantined and re-synthesis failed after "
+                f"{len(getattr(result, 'attempts', []) or [])} attempts"
+            )
+        memory.set_skill_version(self.db, step.operation, new_version)
+        self.skill_health_events.append({
+            "operation": step.operation, "event": "healed", "version": new_version,
+        })
+        return memory.get_skill(self.db, step.operation)
 
     def _skill_kwargs(self, step: Step, contract: dict | None) -> dict[str, Any]:
         """Build the skill's kwargs via the shared resolver — real run references outrank the
@@ -323,6 +383,7 @@ class Executor:
         self.run_refs = {}           # fresh within-run reference scope
         self.synthesis_events = []   # fresh per-run synthesis log
         self.preapplied_rules = []   # fresh per-run pre-applied-rule log
+        self.skill_health_events = []  # fresh per-run skill quarantine/heal log
         self._results = []           # every executed / injected / skipped step result
         self._completed = []         # done mutations, flipped to rolled_back on a fatal stop
         self._meta = {}              # exec-seq -> (intent, operation, kind) for record_step
