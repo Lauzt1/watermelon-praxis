@@ -79,3 +79,22 @@ def test_quarantined_skill_is_resynthesised_on_dispatch(db):
     healed = memory.get_skill(db, name)
     assert healed["status"] == "active" and healed["version"] == 2
     assert any(e["event"] == "healed" for e in ex.skill_health_events)
+
+
+from praxis.reporter import render
+from praxis.models import Report
+
+
+def test_report_renders_skill_health():
+    r = Report(instruction="i", status="ok", steps=[],
+               metrics={"api_calls": 1, "llm_calls": 0, "wall_ms": 1, "failure_count": 0},
+               memory_delta={"skill_health": [
+                   {"operation": "compute.demo", "event": "healed", "version": 2}]},
+               synthesis_events=[])
+    assert "Skill health: compute.demo healed -> v2" in render(r)
+
+
+def test_render_memory_shows_skill_confidence(db):
+    from praxis.main import render_memory
+    _register(db)
+    assert "conf=1.00" in render_memory(db)

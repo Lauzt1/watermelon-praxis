@@ -41,6 +41,7 @@ class Orchestrator:
             "plan_stored": not had_cached_plan,
             "skills_synthesized": synthesized,
             "preapplied_rules": executor.preapplied_rules,
+            "skill_health": executor.skill_health_events,
         }
         report = build_report(
             instruction, results,

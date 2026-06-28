@@ -113,8 +113,9 @@ def render_memory(db, operation: str | None = None) -> str:
     if not skills:
         lines.append("  (none)")
     for s in skills:
+        conf = memory.skill_confidence(s["uses"], s["successes"])
         lines.append(f"  {s['name']} [{s['status']} v{s['version']}] "
-                     f"uses={s['uses']} ok={s['successes']} fail={s['failures']}")
+                     f"conf={conf:.2f} uses={s['uses']} ok={s['successes']} fail={s['failures']}")
     return "\n".join(lines)
 
 

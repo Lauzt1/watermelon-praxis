@@ -73,7 +73,14 @@ def render(report: Report) -> str:
         for pr in preapplied:
             lines.append(f"Pre-applied rule (learned run #{pr.get('learned_in_run')}): "
                          f"{pr.get('operation')} -> {pr.get('action')}")
-        rest = {k: v for k, v in delta.items() if k != "preapplied_rules"}
+        # capability-layer learning: a degraded skill quarantined/rebuilt this run (spec §7.1)
+        for ev in delta.get("skill_health") or []:
+            line = f"Skill health: {ev.get('operation')} {ev.get('event')} -> v{ev.get('version')}"
+            if "confidence" in ev:
+                line += f" (confidence {ev['confidence']})"
+            lines.append(line)
+        rest = {k: v for k, v in delta.items()
+                if k not in ("preapplied_rules", "skill_health")}
         if rest:
             lines.append("Memory delta: " + " ".join(f"{k}={v}" for k, v in rest.items()))
     if report.synthesis_events:
