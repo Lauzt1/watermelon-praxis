@@ -55,6 +55,11 @@ class Executor:
         self.preapplied_rules: list[dict[str, Any]] = []
         # Skill quarantine/heal events recorded this run, surfaced by the reporter (spec §7.1).
         self.skill_health_events: list[dict[str, Any]] = []
+        # Marker labels a fan-out EXCLUDES (its skip_if_label / the label it adds). The list
+        # sanitizer strips these from any inclusion filter so a planner's bare labels=[marker]
+        # (no label_mode) can't invert "not-yet-triaged" into "only-already-triaged". Recomputed
+        # per run() from the whole plan, since one step can't see the others' args.
+        self._fan_out_skip_labels: frozenset[str] = frozenset()
 
     # --- dispatch ---------------------------------------------------------------
 
@@ -176,12 +181,16 @@ class Executor:
     _LABEL_EXCLUSION_MODES = frozenset({"none", "not", "exclude", "without", "negate", "absent"})
 
     @classmethod
-    def _sanitize_list_filters(cls, filters):
+    def _sanitize_list_filters(cls, filters, exclude_labels=frozenset()):
         """Keep only GitHub-recognized list params, and strip a label-EXCLUSION so it never reaches
         the API as an inclusion. The planner expresses 'not-yet-triaged' as labels=[X]+label_mode=
         "none" (or a '!'-prefixed label); forwarded verbatim that returns the issues that HAVE X —
         the exact opposite — emptying the fan-out snapshot into a silent no-op. Exclusion is the
-        fan-out's job (skip_if_label) against the pre-enrichment snapshot, not the list query's."""
+        fan-out's job (skip_if_label) against the pre-enrichment snapshot, not the list query's.
+
+        `exclude_labels` are the plan's fan-out marker labels: even a BARE labels=[marker] with no
+        label_mode (what a live run's planner actually emitted) is an exclusion if a downstream
+        fan-out skips/adds that same label — strip just those, keeping genuine inclusions."""
         if not isinstance(filters, dict):
             return filters
         mode = str(filters.get("label_mode", "")).strip().lower()
@@ -192,7 +201,32 @@ class Executor:
         clean = {k: v for k, v in filters.items() if k in cls._GH_LIST_PARAMS}
         if excluding:
             clean.pop("labels", None)
+        elif exclude_labels and "labels" in clean:
+            kept = [l for l in label_list
+                    if not (isinstance(l, str) and l.strip() in exclude_labels)]
+            if not kept:
+                clean.pop("labels", None)
+            elif len(kept) != len(label_list):
+                clean["labels"] = kept
         return clean
+
+    def _collect_fan_out_skip_labels(self, steps) -> frozenset[str]:
+        """The marker labels any fan-out step in this plan EXCLUDES: its skip_if_label, plus the
+        label a fan-out add_label adds (which defaults its own skip — natural idempotency). These
+        are the labels that must never be forwarded as a list inclusion."""
+        markers: set[str] = set()
+        for step in steps:
+            args = getattr(step, "args", None) or {}
+            if not self._wants_fan_out(args):
+                continue
+            skip = args.get("skip_if_label")
+            if isinstance(skip, str) and skip.strip():
+                markers.add(skip.strip())
+            if step.operation == "issues.add_label":
+                lab = args.get("label") or (args.get("labels") or [None])[0]
+                if isinstance(lab, str) and lab.strip():
+                    markers.add(lab.strip())
+        return frozenset(markers)
 
     def _dispatch(self, step: Step) -> Any:
         op, args, repo = step.operation, step.args, self.client.repo
@@ -217,7 +251,8 @@ class Executor:
             milestone = self._resolve_milestone(args.get("milestone"))
             return self.client.rest_patch(f"/repos/{repo}/issues/{issue}", json={"milestone": milestone})
         if op == "issues.list":
-            filters = self._sanitize_list_filters(args.get("filters") or args)
+            filters = self._sanitize_list_filters(args.get("filters") or args,
+                                                  self._fan_out_skip_labels)
             resp = self.client.rest_get(f"/repos/{repo}/issues", params=filters or None)
             self.run_refs["issues"] = resp        # thread the list to a downstream compute step
             return resp
@@ -380,6 +415,7 @@ class Executor:
         learning the rule, running the prerequisite, and retrying. Steps are numbered in
         EXECUTION order so injected prerequisites and retries read naturally in the report."""
         self.run_id = run_id
+        self._fan_out_skip_labels = self._collect_fan_out_skip_labels(steps)
         self.run_refs = {}           # fresh within-run reference scope
         self.synthesis_events = []   # fresh per-run synthesis log
         self.preapplied_rules = []   # fresh per-run pre-applied-rule log

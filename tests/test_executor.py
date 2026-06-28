@@ -775,6 +775,42 @@ def test_list_label_exclusion_is_not_forwarded_to_the_list_api(db):
         "a label-exclusion on the list step must not zero out the fan-out snapshot"
 
 
+def test_list_bare_label_inclusion_matching_fanout_skip_is_stripped(db):
+    # the EXACT Instruction-3 no-op a live run (run #4) surfaced: the planner emitted the
+    # "not-yet-triaged" exclusion as a BARE inclusion labels=[needs-triage] with NO label_mode
+    # marker and no "!" prefix. The marker-based guard can't see it, but a downstream fan-out
+    # that skips / adds that same label proves it is an exclusion marker, not an inclusion —
+    # so it must be stripped from the list query or the snapshot zeroes out into a silent no-op.
+    client = LabelFilterAwareTriageClient()
+    steps = [
+        Step(seq=1, intent="list open unassigned not-yet-triaged", operation="issues.list",
+             kind="api", args={"filters": {"state": "open", "assignee": "none",
+                                           "labels": ["needs-triage"]}}),
+        Step(seq=2, intent="triage label", operation="issues.add_label", kind="api",
+             args={"label": "needs-triage", "target": "all", "skip_if_label": "needs-triage"}),
+    ]
+    results = Executor(db, client).run(run_id=1, steps=steps)
+    assert all(r.status == "done" for r in results)
+    assert _labeled_issue_numbers(client) == [1, 2], \
+        "a bare labels-inclusion equal to the fan-out's skip label must not zero the snapshot"
+
+
+def test_list_genuine_label_inclusion_is_preserved_when_not_the_fanout_marker(db):
+    # the guard must be PRECISE: only the fan-out's own marker label is stripped. A genuine
+    # inclusion ("among issues labeled bug, add needs-triage") must still reach the list API.
+    client = LabelFilterAwareTriageClient()
+    steps = [
+        Step(seq=1, intent="list bug issues", operation="issues.list", kind="api",
+             args={"filters": {"state": "open", "labels": ["bug"]}}),
+        Step(seq=2, intent="triage label", operation="issues.add_label", kind="api",
+             args={"label": "needs-triage", "target": "all", "skip_if_label": "needs-triage"}),
+    ]
+    Executor(db, client).run(run_id=1, steps=steps)
+    # only #1 carries "bug" -> the inclusion is honored and only #1 is enriched
+    assert _labeled_issue_numbers(client) == [1], \
+        "a non-marker inclusion filter must not be stripped"
+
+
 def test_set_milestone_fan_out_cold_learns_then_applies_to_all(db):
     # cold: set_milestone by title fans out, the first patch 422s -> learn the precondition,
     # synthesise+run milestones.ensure (creates + caches Sprint 1), retry -> every target issue
