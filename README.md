@@ -3,8 +3,9 @@
 Praxis turns a natural-language instruction into **real GitHub API execution**, backed by persistent
 structured memory that changes its decisions across runs, **runtime capability synthesis** (it writes
 and tests new tool code on the fly), and a **measurable self-learning loop** (api/llm/wall/failure
-counts that decline as memory is used). No agent framework, no vector DB — the LLM is the brain;
-deterministic Python + SQLite are the hands and the memory.
+counts that decline as memory is used), and **self-healing skills** (a synthesised tool whose success
+rate falls is quarantined and rebuilt automatically). No agent framework, no vector DB — the LLM is
+the brain; deterministic Python + SQLite are the hands and the memory.
 
 - **Architecture** (the brief's three questions, with real numbers): [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - **Demo** (the three instructions, expected behaviour, exact commands): [`docs/DEMO.md`](docs/DEMO.md)
@@ -53,10 +54,11 @@ delta). Add `--json` for machine output, or `--no-learning` for the zero-memory 
 | `doctor` | check keys, DB/schema, live GitHub `/user` + repo access |
 | `seed` | idempotently reset the sandbox repo to the known demo issues |
 | `prewarm --times N` | run the three demo instructions N rounds to populate memory |
-| `memory [--operation OP]` | inspect learned rules, ref-cache, op-stats, and the skill registry |
+| `memory [--operation OP]` | inspect learned rules, ref-cache, op-stats, and the skill registry with confidence |
 | `stats "<instruction>"` | run-1-vs-N metrics table for an instruction (matched by signature) |
 | `curve "<instruction>"` | export a learning-curve CSV + SVG to `data/` |
 | `compact [--keep-recent N]` | trim old `run_steps` into aggregates; keep `runs`/`op_stats` authoritative |
+| `skills [--break NAME]` | list synthesised skills + health (status/version/confidence); `--break` simulates drift to demo self-healing |
 
 ## Tests
 
