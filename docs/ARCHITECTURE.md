@@ -44,6 +44,11 @@ Synthesizer (`synthesizer.py`) runs a five-step loop:
 Instruction 2's `compute.group_by_label_and_render_table` is the on-camera proof of pure synthesis;
 `milestones.ensure` is the effectful one.
 
+Synthesised skills are not trusted forever: every dispatch updates the skill's success rate, and a
+skill whose `confidence = successes/uses` falls below 0.5 (after ≥3 uses) is **quarantined and
+re-synthesised with a version bump** on its next use — the agent repairs its own tools rather than
+running stale code (platform drift, or a synthesis that rots against changed data).
+
 ## 3. What's the learning signal, and what changes on run N vs run 1?
 
 The signal is **api_calls, llm_calls, wall_ms, failure_count per run**, read live from `runs`.
@@ -62,7 +67,10 @@ wall 70.1s→36.5s, **failures 1→0**, zero synthesis (skill reused), milestone
 (the 422 eliminated). Honest framing: for create-heavy work the API floor is the irreducible
 mutation — the decline kills *overhead* calls (id resolution, the 422 retry, re-planning), not the
 create itself. Compaction keeps recall cheap at scale: 900 run_steps → 30, recall 1.68 ms →
-0.12 ms (~14×), with the `runs` ledger and `op_stats` untouched.
+0.12 ms (~14×), with the `runs` ledger and `op_stats` untouched. A second, capability-layer signal
+comes from skill self-healing: a degraded skill's confidence recovers after a rebuild (e.g. 0.33 →
+quarantined → 1.0) and the healed run's `failure_count` returns to 0 — learning on the *tools*, not
+just the per-run cost ledger.
 
 ## What I'd build next
 
@@ -71,4 +79,5 @@ create itself. Compaction keeps recall cheap at scale: 900 run_steps → 30, rec
 - **Deeper synthesis verification** — an explicit `verify(client, result)` post-condition per skill.
 - **Optional embedding recall layer**, off by default, only if the corpus outgrows
   exact-signature matching.
-- **Confidence scoring** on synthesised skills — quarantine on a falling success rate before acting.
+- **Eager in-run self-healing** (rebuild + retry within the same run, vs the shipped lazy
+  across-runs heal) and **rule-confidence decay** on contradiction.
