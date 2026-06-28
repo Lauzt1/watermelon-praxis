@@ -371,6 +371,45 @@ def compaction_trims_steps_and_preserves_runs_and_stats():
             conn.close()
 
 
+@check
+def skill_health_quarantine_and_heal():
+    """Spec §7.1: a degraded skill is quarantined, and a quarantined skill is re-synthesised
+    (version+1) on its next dispatch — the capability layer changes behaviour. Offline."""
+    import tempfile
+    from pathlib import Path
+    from praxis.db import connect
+    from praxis import memory
+    from praxis.executor import Executor
+    from praxis.models import SkillContract, Step
+    from praxis.synthesizer import SynthesisResult
+    with tempfile.TemporaryDirectory() as d:
+        conn = connect(Path(d) / "t.db")
+        name = "compute.demo"
+        assert memory.skill_confidence(0, 0) == 1.0 and memory.skill_confidence(4, 2) == 0.5
+        c = SkillContract(name=name, inputs={"items": "list"}, output="sorted",
+                          primitives=[], test_args={"items": [3, 1, 2]})
+        memory.put_skill(conn, name, c, "def skill(client, items):\n    return sorted(items)")
+        memory.bump_skill_stats(conn, name, True)
+        memory.bump_skill_stats(conn, name, False)
+        memory.bump_skill_stats(conn, name, False)
+        Executor(conn, client=None)._maybe_quarantine(name)
+        assert memory.get_skill(conn, name)["status"] == "quarantined", "should quarantine"
+
+        def stub(step, refs=None):
+            good = SkillContract(name=step.operation, inputs={"items": "list"}, output="sorted",
+                                 primitives=[], test_args={"items": [3, 1, 2]})
+            memory.put_skill(conn, step.operation, good,
+                             "def skill(client, items):\n    return sorted(items)", status="active")
+            return SynthesisResult(ok=True, operation=step.operation)
+
+        ex = Executor(conn, client=None, synthesizer=stub)
+        ex.run_refs = {"items": [3, 1, 2]}
+        out = ex._dispatch_skill(Step(seq=1, intent="x", operation=name, kind="compute", args={}))
+        assert out == [1, 2, 3], "healed skill should run"
+        assert memory.get_skill(conn, name)["version"] == 2, "version bumped on heal"
+        conn.close()
+
+
 def main():
     failed = 0
     for fn in CHECKS:
