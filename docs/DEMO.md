@@ -63,6 +63,13 @@ the showcase skill is still synthesised **live** in the demo to prove synthesis 
   still posted. `skills` afterward shows `[active v2] conf=1.00`. Measurable: `confidence` recovers and
   `failure_count` stays 0 on the healed run. (The natural path — auto-quarantine after a skill's
   success rate falls below 0.5 over ≥3 uses — is proven offline in `tests/test_skill_health.py`.)
+- **Recorded live (run_id=5):** before — `compute.group_by_label_and_render_table [active v1]
+  conf=1.00`; `--break` → `quarantined, code corrupted`; the next run reports `Status: OK`,
+  `api_calls=2 llm_calls=3 failure_count=0`, `Skill health: compute.group_by_label_and_render_table
+  healed -> v2`, and the heal synthesis event `{'ok': True, 'heal': True, 'version': 2, 'attempts': 1}`;
+  after — `[active v2] conf=1.00 uses=1 ok=1 fail=0`. The broken code never ran, and a real triage
+  issue was posted (`api_calls=2` = `issues.list` + `issues.create`; the pure transform makes no API
+  call).
 
 ## Instruction 3 — Synthesis + transfer (THE headline)
 
