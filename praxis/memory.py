@@ -233,6 +233,37 @@ def get_skill(db: sqlite3.Connection, name: str) -> dict[str, Any] | None:
     }
 
 
+def bump_skill_stats(db: sqlite3.Connection, name: str, success: bool) -> None:
+    """Record one skill-dispatch outcome (spec §7.1). No-op if the skill isn't registered (a
+    skill that failed before it could be registered has nothing to update)."""
+    row = db.execute(
+        "SELECT uses, successes, failures FROM skills WHERE name=?", (name,)
+    ).fetchone()
+    if row is None:
+        return
+    db.execute(
+        "UPDATE skills SET uses=?, successes=?, failures=? WHERE name=?",
+        (row["uses"] + 1, row["successes"] + (1 if success else 0),
+         row["failures"] + (0 if success else 1), name),
+    )
+    db.commit()
+
+
+def set_skill_status(db: sqlite3.Connection, name: str, status: str) -> None:
+    db.execute("UPDATE skills SET status=? WHERE name=?", (status, name))
+    db.commit()
+
+
+def set_skill_version(db: sqlite3.Connection, name: str, version: int) -> None:
+    db.execute("UPDATE skills SET version=? WHERE name=?", (version, name))
+    db.commit()
+
+
+def skill_confidence(uses: int, successes: int) -> float:
+    """successes/uses, with 0 uses -> 1.0 (a freshly synthesised+tested skill is trusted)."""
+    return 1.0 if uses == 0 else successes / uses
+
+
 # --- undo journal ---------------------------------------------------------------
 
 def journal_append(db: sqlite3.Connection, run_id: int, seq: int, inverse: InverseOp) -> None:
